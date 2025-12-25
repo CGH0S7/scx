@@ -50,10 +50,14 @@ s32 BPF_STRUCT_OPS(tssc_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wak
     }
 
     /*
-     * 4. LAST RESORT: Return current CPU or prev_cpu as ultimate fallback
-     * This should never happen if cpus_ptr is valid, but we need to handle it.
+     * 4. LAST RESORT: Return any valid CPU in the mask.
+     * We avoid blindly returning current_cpu because it might violate affinity,
+     * which causes the kernel to unload the scheduler (UEI crash).
      */
-    return current_cpu >= 0 ? current_cpu : (prev_cpu >= 0 ? prev_cpu : 0);
+    if (current_cpu >= 0 && bpf_cpumask_test_cpu(current_cpu, p->cpus_ptr)) {
+        return current_cpu;
+    }
+    return bpf_cpumask_first(p->cpus_ptr);
 }
 
 void BPF_STRUCT_OPS(tssc_enqueue, struct task_struct *p, u64 enq_flags)
@@ -63,24 +67,28 @@ void BPF_STRUCT_OPS(tssc_enqueue, struct task_struct *p, u64 enq_flags)
     u64 slice = TSSC_SLICE_INF;
     bool is_congested = false;
 
-    /* Safety fallback: Select a valid CPU if the current one is invalid */
-    if (cpu < 0) {
+    /* 
+     * Safety fallback: Ensure CPU is valid and allowed.
+     * If cpu is invalid (<0) OR not in the affinity mask, pick a valid one.
+     */
+    if (cpu < 0 || !bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
         cpu = bpf_cpumask_any_distribute(p->cpus_ptr);
         if (cpu < 0) {
-            /* Ultimate fallback - use current CPU */
-            cpu = current_cpu;
+            /* Ultimate fallback: first allowed CPU */
+            cpu = bpf_cpumask_first(p->cpus_ptr);
         }
     }
 
     /*
      * CRITICAL SAFETY VALVE:
-     * Check if the local queue already has tasks waiting BEFORE inserting the current task.
-     * This gives us a more accurate picture of congestion.
+     * Check congestion.
+     * 1. If nr_queued > 0, we have waiters.
      * 
-     * If nr_queued > 0, it means we have contention (e.g., HPC Task vs System Daemon).
-     * In this case, we MUST NOT give infinite slice, otherwise the task at the back 
-     * of the line might never run. We switch to a finite slice to ensure round-robin 
-     * fairness during congestion.
+     * Note: We cannot easily check if the CPU is currently running a task (is_idle)
+     * without 'scx_bpf_test_cpu_idle', so we rely on queue depth. This prevents
+     * starvation when multiple tasks are queued, but might allow a new task to
+     * preempt a running task and take an infinite slice (Newcomer Bully).
+     * However, the critical affinity fix ensures we don't crash.
      */
     u64 current_queued = scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpu);
     is_congested = (current_queued > 0);
