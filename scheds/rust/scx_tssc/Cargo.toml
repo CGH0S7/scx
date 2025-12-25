@@ -1,0 +1,18 @@
+[package]
+name = "scx_tssc"
+version = "0.1.0"
+edition = "2021"
+description = "HPC/ASC oriented scheduler for high throughput and pinning"
+license = "GPL-2.0-only"
+
+[dependencies]
+anyhow = "1.0"
+ctrlc = "3.4"
+clap = { version = "4.5", features = ["derive", "env"] }
+env_logger = "0.11"
+log = "0.4"
+scx_utils = { path = "../../../rust/scx_utils" }
+libbpf-rs = "=0.26.0-beta.1"
+
+[build-dependencies]
+scx_cargo = { path = "../../../rust/scx_cargo" }
