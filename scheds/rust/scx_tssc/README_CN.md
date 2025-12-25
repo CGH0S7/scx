@@ -105,9 +105,6 @@ cat /sys/kernel/sched_ext/tssc/stats
 # 检查 NUMA 局部性统计
 cat /sys/kernel/sched_ext/tssc/stats | grep -E "(local_numa|cross_numa)"
 
-# 监控缓存效率
-cat /sys/kernel/sched_ext/tssc/stats | grep -E "(cache_hits|cache_misses)"
-
 # 检查UEI（用户空间退出信息）事件
 journalctl -t scx_tssc
 
@@ -119,12 +116,9 @@ watch -n 1 'cat /sys/kernel/sched_ext/tssc/stats'
 
 - `tasks_local_numa`：放置在同 NUMA 节点的任务数
 - `tasks_cross_numa`：需要跨 NUMA 访问的任务数
-- `cache_hits/cache_misses`：估算的缓存效率
-- `numa_migrations`：跨 NUMA 任务迁移次数
 - `kicks_local_numa/kicks_cross_numa`：按 NUMA 分类的唤醒效率
 
 **调优建议：**
 
 - 监控 `tasks_cross_numa` - 应该 <10% 以获得最佳性能
-- 高 `cache_misses` 表示 NUMA 放置不当
 - 平衡 `infinite_slices` 与 `congested_slices` 以兼顾公平性和吞吐量

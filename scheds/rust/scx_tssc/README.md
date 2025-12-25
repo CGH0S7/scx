@@ -90,9 +90,6 @@ cat /sys/kernel/sched_ext/tssc/stats
 # Check NUMA locality statistics
 cat /sys/kernel/sched_ext/tssc/stats | grep -E "(local_numa|cross_numa)"
 
-# Monitor cache efficiency
-cat /sys/kernel/sched_ext/tssc/stats | grep -E "(cache_hits|cache_misses)"
-
 # Check for any UEI (User-space Exit Information) events
 journalctl -t scx_tssc
 
@@ -104,12 +101,9 @@ watch -n 1 'cat /sys/kernel/sched_ext/tssc/stats'
 
 - `tasks_local_numa`: Tasks placed on same NUMA node
 - `tasks_cross_numa`: Tasks requiring cross-NUMA access
-- `cache_hits/cache_misses`: Estimated cache efficiency
-- `numa_migrations`: Cross-NUMA task migrations
 - `kicks_local_numa/kicks_cross_numa`: Wakeup efficiency by NUMA
 
 **Competition Tuning Tips:**
 
 - Monitor `tasks_cross_numa` - should be <10% for optimal performance
-- High `cache_misses` indicates suboptimal NUMA placement
 - Balance `infinite_slices` vs `congested_slices` for fairness vs throughput
