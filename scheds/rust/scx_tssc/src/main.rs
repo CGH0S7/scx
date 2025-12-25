@@ -62,7 +62,7 @@ struct Opts {
 
     /// Maximum scheduling slice duration in microseconds (applied only when multiple tasks are
     /// contending the same CPU).
-    #[clap(short = 's', long, default_value = "20000")]
+    #[clap(short = 's', long, default_value = "30000")]
     slice_us: u64,
 
     /// Frequency of the tick triggered on the scheduling CPUs to check for task time slice
@@ -142,8 +142,15 @@ impl<'a> Scheduler<'a> {
         // Process the domain of primary CPUs.
         let mut domain = Cpumask::from_str(&opts.primary_domain)?;
         if domain.is_empty() {
-            if let Some(cpu) = cpus.last() {
-                domain = Cpumask::from_str(&format!("{:x}", 1 << cpu.id).to_string())?;
+            for node in topo.nodes.values() {
+                if let Some(first_cpu_id) = node.all_cpus.keys().next() {
+                    domain.set_cpu(*first_cpu_id)?;
+                }
+            }
+            if domain.is_empty() {
+                if let Some(cpu) = cpus.last() {
+                    domain.set_cpu(cpu.id)?;
+                }
             }
         }
         info!("primary CPU domain = 0x{:x}", domain);
