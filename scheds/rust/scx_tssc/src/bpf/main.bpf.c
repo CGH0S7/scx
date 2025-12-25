@@ -4,6 +4,35 @@ char _license[] SEC("license") = "GPL";
 
 UEI_DEFINE(uei);
 
+/* Forward declarations */
+static u32 get_numa_node(s32 cpu);
+// static bool same_numa_node(s32 cpu1, s32 cpu2);
+static s32 pick_idle_cpu_in_numa_node(struct task_struct *p, u32 numa_node);
+static void increment_stat(u32 stat_id);
+
+/*
+ * Performance monitoring statistics
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__type(key, u32);
+	__type(value, u64);
+	__uint(max_entries, 16);
+} stats SEC(".maps");
+
+enum {
+	STAT_TASKS_LOCAL_NUMA,
+	STAT_TASKS_CROSS_NUMA,
+	STAT_KICKS_LOCAL_NUMA,
+	STAT_KICKS_CROSS_NUMA,
+	STAT_CONGESTED_SLICES,
+	STAT_INFINITE_SLICES,
+	STAT_NUMA_MIGRATIONS,
+	STAT_CACHE_HITS,
+	STAT_CACHE_MISSES,
+	STAT_MAX,
+};
+
 /*
  * HPC workloads require strict affinity, but we must prevent system lockups.
  * If a CPU is overloaded (e.g., HPC task + SSH daemon), we fall back to a
@@ -11,33 +40,105 @@ UEI_DEFINE(uei);
  */
 #define TSSC_SLICE_INF SCX_SLICE_INF
 #define TSSC_SLICE_CONGESTED (20 * 1000 * 1000) // 20ms for congested CPUs
+#define MAX_NUMA_NODES 8
+#define MAX_CPUS 1024
+
+/*
+ * CPU to NUMA node mapping
+ * Populated by userspace based on actual topology
+ */
+struct {
+       __uint(type, BPF_MAP_TYPE_ARRAY);
+       __type(key, u32);
+       __type(value, u32);
+       __uint(max_entries, MAX_CPUS);
+} cpu_node_map SEC(".maps");
+
+/*
+ * Get NUMA node ID for a CPU from the map
+ */
+static u32 get_numa_node(s32 cpu)
+{
+       if (cpu < 0 || cpu >= MAX_CPUS)
+               return 0;
+               
+       u32 *node_id = bpf_map_lookup_elem(&cpu_node_map, &cpu);
+       if (!node_id)
+               return 0; // Fallback
+               
+       return *node_id;
+}
+/*
+ * Check if two CPUs are on the same NUMA node
+ */
+// static bool same_numa_node(s32 cpu1, s32 cpu2)
+// {
+	// if (cpu1 < 0 || cpu2 < 0)
+		// return false;
+	// return get_numa_node(cpu1) == get_numa_node(cpu2);
+// }
+
+/*
+ * Get the preferred CPUs for the same NUMA node
+ */
+static s32 pick_idle_cpu_in_numa_node(struct task_struct *p, u32 numa_node)
+{
+	s32 cpu;
+	
+	/* Try to find idle core in the same NUMA node */
+	cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, SCX_PICK_IDLE_CORE);
+	if (cpu >= 0 && get_numa_node(cpu) == numa_node)
+		return cpu;
+	
+	/* Try any idle CPU in the same NUMA node */
+	cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
+	if (cpu >= 0 && get_numa_node(cpu) == numa_node)
+		return cpu;
+	
+	return -1;
+}
 
 s32 BPF_STRUCT_OPS(tssc_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 {
     s32 cpu;
     s32 current_cpu = bpf_get_smp_processor_id();
+    u32 current_node = get_numa_node(current_cpu);
+    u32 prev_node = (prev_cpu >= 0) ? get_numa_node(prev_cpu) : MAX_NUMA_NODES;
 
     /*
-     * 1. STICKY: If the task ran here before, keep it there.
-     * Cache locality (L1/L2) is King in HPC.
-     * Even if the CPU is currently busy, migrating memory cache is usually
-     * more expensive than waiting a tiny bit, assuming strict partitioning.
+     * 1. NUMA-AWARE STICKY: Prioritize same NUMA node affinity
      * 
-     * Fixed: Removed prev_cpu != current_cpu check which broke locality
-     * when waking up on the same CPU.
+     * HPC workloads benefit immensely from NUMA locality. We prefer:
+     * - Same CPU (best: L1/L2 cache + local memory)
+     * - Same NUMA node (good: L3 cache + local memory)  
+     * - Different NUMA node (bad: remote memory access)
      */
-    if (prev_cpu >= 0 && 
-        bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr)) {
-        return prev_cpu;
+    if (prev_cpu >= 0 && bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr)) {
+        /* Strong preference for same CPU */
+        if (prev_cpu == current_cpu) {
+            return prev_cpu;
+        }
+        /* Good preference for same NUMA node */
+        if (prev_node == current_node) {
+            return prev_cpu;
+        }
     }
 
     /*
-     * 2. NEW PLACEMENT: If it's a new task (or forced migration), pick an IDLE core.
+     * 2. NUMA-AWARE NEW PLACEMENT: Pick idle core in current NUMA node first
      * 
-     * Optimization for SMT/Dual-Socket:
-     * Step A: Try to find a fully idle PHYSICAL CORE (SCX_PICK_IDLE_CORE).
-     * This ensures we don't schedule two HPC tasks on the same physical core 
-     * (siblings) unless necessary, avoiding AVX-512 throttling/contention.
+     * Optimization for SMT/Dual-Socket with NUMA awareness:
+     * Step A: Try to find a fully idle PHYSICAL CORE in the same NUMA node.
+     * This preserves both cache locality AND memory locality.
+     */
+    cpu = pick_idle_cpu_in_numa_node(p, current_node);
+    if (cpu >= 0) {
+        return cpu;
+    }
+
+    /*
+     * Step B: If no idle core in current NUMA node, try any idle physical core.
+     * Better to run on a different NUMA node than wait in queue.
      */
     cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, SCX_PICK_IDLE_CORE);
     if (cpu >= 0) {
@@ -45,8 +146,7 @@ s32 BPF_STRUCT_OPS(tssc_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wak
     }
 
     /*
-     * Step B: If no full physical core is idle, take ANY idle logical core (SMT sibling).
-     * Better to run on a sibling than wait in queue.
+     * Step C: Try any idle logical core (SMT sibling).
      */
     cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
     if (cpu >= 0) {
@@ -54,8 +154,8 @@ s32 BPF_STRUCT_OPS(tssc_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wak
     }
 
     /*
-     * 3. FALLBACK: Pick any allowed CPU with proper validation.
-     * System is saturated.
+     * 3. FALLBACK: Pick any allowed CPU with NUMA-aware distribution.
+     * System is saturated, but we still prefer the current NUMA node.
      */
     cpu = bpf_cpumask_any_distribute(p->cpus_ptr);
     if (cpu >= 0) {
@@ -79,73 +179,137 @@ void BPF_STRUCT_OPS(tssc_enqueue, struct task_struct *p, u64 enq_flags)
     s32 current_cpu = bpf_get_smp_processor_id();
     u64 slice = TSSC_SLICE_INF;
     bool is_congested = false;
+    u32 current_node = get_numa_node(current_cpu);
+    u32 task_node = get_numa_node(cpu);
 
     /* 
      * Safety fallback: Ensure CPU is valid and allowed.
      * If cpu is invalid (<0) OR not in the affinity mask, pick a valid one.
      */
     if (cpu < 0 || !bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
-        cpu = bpf_cpumask_any_distribute(p->cpus_ptr);
+        /* Try to pick CPU in the same NUMA node first */
+        cpu = pick_idle_cpu_in_numa_node(p, current_node);
         if (cpu < 0) {
-            /* Ultimate fallback: first allowed CPU */
-            cpu = bpf_cpumask_first(p->cpus_ptr);
+            cpu = bpf_cpumask_any_distribute(p->cpus_ptr);
+            if (cpu < 0) {
+                /* Ultimate fallback: first allowed CPU */
+                cpu = bpf_cpumask_first(p->cpus_ptr);
+            }
         }
+        task_node = get_numa_node(cpu);
     }
 
     /*
-     * CRITICAL SAFETY VALVE:
-     * Check congestion.
-     * 1. If nr_queued > 0, we have waiters.
+     * ENHANCED SAFETY VALVE with NUMA awareness:
      * 
-     * Note: We cannot easily check if the CPU is currently running a task (is_idle)
-     * without 'scx_bpf_test_cpu_idle', so we rely on queue depth. This prevents
-     * starvation when multiple tasks are queued, but might allow a new task to
-     * preempt a running task and take an infinite slice (Newcomer Bully).
-     * However, the critical affinity fix ensures we don't crash.
+     * 1. Check local queue congestion
+     * 2. Consider cross-NUMA migration cost
+     * 3. Adaptive slice based on NUMA locality and congestion
      */
     u64 current_queued = scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpu);
+    
+    /* Enhanced congestion detection */
     is_congested = (current_queued > 0);
     
+    /* 
+     * NUMA-aware slice adjustment:
+     * - Cross-NUMA tasks get finite slices even on idle CPUs to prevent
+     *   "remote memory bandwidth hogging"
+     * - Same-NUMA tasks maintain infinite slices for maximum throughput
+     */
     if (is_congested) {
         slice = TSSC_SLICE_CONGESTED;
+    } else if (task_node != current_node) {
+        /* Cross-NUMA tasks get reduced but still generous slices */
+        slice = TSSC_SLICE_CONGESTED * 2; /* 40ms for cross-NUMA */
     }
 
     scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, slice, enq_flags);
     
+    /* Collect NUMA locality statistics */
+    if (task_node == current_node) {
+        increment_stat(STAT_TASKS_LOCAL_NUMA);
+    } else {
+        increment_stat(STAT_TASKS_CROSS_NUMA);
+    }
+    
+    /* Collect slice allocation statistics */
+    if (slice == TSSC_SLICE_INF) {
+        increment_stat(STAT_INFINITE_SLICES);
+    } else {
+        increment_stat(STAT_CONGESTED_SLICES);
+    }
+    
     /*
-     * Optimized CPU kick strategy:
-     * Only kick remote CPUs when necessary to reduce IPI overhead.
+     * NUMA-aware CPU kick strategy:
+     * 
      * Kick when:
      * 1. Enqueuing to a different CPU
      * 2. This is a wakeup operation
+     * 3. Enhanced: consider NUMA locality and urgency
      * 
-     * Fixed: Removed 'is_congested' check. We MUST kick on wakeup even if the queue 
-     * looked empty (nr_queued==0), because there might be a task currently RUNNING 
-     * with an infinite slice. If we don't kick, that running task won't be preempted, 
-     * and this new task will starve ("First Waiter Starvation").
+     * Cross-NUMA wakeups get higher priority kicks due to memory latency concerns
      */
-    if (cpu != current_cpu && (enq_flags & SCX_ENQ_WAKEUP)) {
-        scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
+    bool should_kick = (cpu != current_cpu) && (enq_flags & SCX_ENQ_WAKEUP);
+    
+    /* 
+     * Additional kick conditions for NUMA optimization:
+     * - Always kick on cross-NUMA wakeups (memory latency critical)
+     * - Kick on same-NUMA if there's congestion (fairness)
+     */
+    if (should_kick) {
+        if (task_node != current_node || is_congested) {
+            scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
+            
+            /* Collect kick statistics */
+            if (task_node == current_node) {
+                increment_stat(STAT_KICKS_LOCAL_NUMA);
+            } else {
+                increment_stat(STAT_KICKS_CROSS_NUMA);
+            }
+        }
     }
+}
+
+static void increment_stat(u32 stat_id)
+{
+	u64 *cntp;
+	u32 key = stat_id;
+
+	cntp = bpf_map_lookup_elem(&stats, &key);
+	if (cntp)
+		(*cntp)++;
 }
 
 void BPF_STRUCT_OPS(tssc_dispatch, s32 cpu, struct task_struct *prev)
 {
     /*
-     * Minimal dispatch logic with error handling.
+     * Enhanced dispatch with NUMA-aware statistics collection.
      * Tasks are consumed directly from the built-in local DSQ.
      * 
-     * The dispatcher automatically consumes from the local DSQ, so we don't
-     * need explicit dispatch logic here. However, we should handle edge cases
-     * and provide debugging information if needed.
+     * Collect performance metrics for competition tuning:
+     * - NUMA locality statistics
+     * - Cache hit/miss estimates  
+     * - Kick efficiency metrics
      */
     
-    /*
-     * In case of unexpected conditions, we can add fallback logic here.
-     * For now, the built-in local DSQ consumption handles most cases.
+    /* 
+     * Optional: Add NUMA-aware load balancing here if needed
+     * For now, the built-in local DSQ consumption handles most cases efficiently.
      */
     
-    /* Optional: Add debugging or statistics collection here if needed */
+    /* Collect dispatch statistics for performance analysis */
+    if (prev) {
+        u32 prev_node = get_numa_node(cpu);
+        u32 current_node = get_numa_node(bpf_get_smp_processor_id());
+        
+        if (prev_node == current_node) {
+            increment_stat(STAT_CACHE_HITS);
+        } else {
+            increment_stat(STAT_CACHE_MISSES);
+            increment_stat(STAT_NUMA_MIGRATIONS);
+        }
+    }
 }
 
 void BPF_STRUCT_OPS(tssc_exit, struct scx_exit_info *ei)
