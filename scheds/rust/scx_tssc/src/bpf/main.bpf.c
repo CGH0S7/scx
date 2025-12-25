@@ -283,44 +283,6 @@ static void increment_stat(u32 stat_id)
 		(*cntp)++;
 }
 
-void BPF_STRUCT_OPS(tssc_dispatch, s32 cpu, struct task_struct *prev)
-{
-    /*
-     * Enhanced dispatch with NUMA-aware statistics collection.
-     * Tasks are consumed directly from the built-in local DSQ.
-     * 
-     * Collect performance metrics for competition tuning:
-     * - NUMA locality statistics
-     * - Cache hit/miss estimates  
-     * - Kick efficiency metrics
-     */
-    
-    /* 
-     * Optional: Add NUMA-aware load balancing here if needed.
-     */
-    
-    /*
-     * CRITICAL FIX: Explicitly consume tasks from the local DSQ.
-     * When the .dispatch callback is implemented, the default behavior of 
-     * automatically consuming the local DSQ is overridden. We must explicitly 
-     * move tasks from the local DSQ to the execution queue.
-     */
-    scx_bpf_dsq_move_to_local(SCX_DSQ_LOCAL);
-    
-    /* Collect dispatch statistics for performance analysis */
-    if (prev) {
-        u32 prev_node = get_numa_node(cpu);
-        u32 current_node = get_numa_node(bpf_get_smp_processor_id());
-        
-        if (prev_node == current_node) {
-            increment_stat(STAT_CACHE_HITS);
-        } else {
-            increment_stat(STAT_CACHE_MISSES);
-            increment_stat(STAT_NUMA_MIGRATIONS);
-        }
-    }
-}
-
 void BPF_STRUCT_OPS(tssc_exit, struct scx_exit_info *ei)
 {
     UEI_RECORD(uei, ei);
@@ -329,6 +291,5 @@ void BPF_STRUCT_OPS(tssc_exit, struct scx_exit_info *ei)
 SCX_OPS_DEFINE(tssc_ops,
            .select_cpu      = (void *)tssc_select_cpu,
            .enqueue         = (void *)tssc_enqueue,
-           .dispatch        = (void *)tssc_dispatch,
            .exit            = (void *)tssc_exit,
            .name            = "scx_tssc");
