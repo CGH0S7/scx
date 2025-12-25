@@ -6,26 +6,26 @@
 
 参考了 `scx_rusty`（架构）和 `scx_tickless`（降噪）的设计，`scx_tssc` 针对 HPC 任务采取了稳健的"即置即忘"策略，并增强了 NUMA 感知能力：
 
-1.  **NUMA 感知的严格亲和性（Strict NUMA-Aware Affinity）**：任务一旦被分配到某个 CPU，就会固定在那里。禁止任务迁移，以最大程度保留 L1/L2 缓存热度**和 NUMA 内存局部性**。任务优先选择同 NUMA 节点的 CPU 以最大化内存访问效率。
+1. **NUMA 感知的严格亲和性（Strict NUMA-Aware Affinity）**：任务一旦被分配到某个 CPU，就会固定在那里。禁止任务迁移，以最大程度保留 L1/L2 缓存热度**和 NUMA 内存局部性**。任务优先选择同 NUMA 节点的 CPU 以最大化内存访问效率。
 
-2.  **NUMA 优化的 SMT 与双路调度（NUMA-Optimized SMT & Dual-Socket）**：新任务优先分配给**同 NUMA 节点内**的完全空闲物理核心（`SCX_PICK_IDLE_CORE`）。这既防止了 AVX-512 降频，又最小化了跨 NUMA 内存延迟（80ns vs 120ns）。
+2. **NUMA 优化的 SMT 与双路调度（NUMA-Optimized SMT & Dual-Socket）**：新任务优先分配给**同 NUMA 节点内**的完全空闲物理核心（`SCX_PICK_IDLE_CORE`）。这既防止了 AVX-512 降频，又最小化了跨 NUMA 内存延迟（80ns vs 120ns）。
 
-3.  **NUMA 感知的自适应时间片（NUMA-Aware Adaptive Slices）**：
+3. **NUMA 感知的自适应时间片（NUMA-Aware Adaptive Slices）**：
     - **本地 NUMA 任务**：`SCX_SLICE_INF` 无限时间片，最大化吞吐量
     - **跨 NUMA 任务**：自适应有限时间片（40ms），防止远程内存带宽独占
     - **拥塞 CPU**：20ms 回退时间片，保证系统响应性
 
-4.  **NUMA 感知的本地分发（NUMA-Aware Local Dispatch）**：任务直接进入本地 DSQ，并智能选择 NUMA 节点，绕过全局共享队列，消除锁竞争。
+4. **NUMA 感知的本地分发（NUMA-Aware Local Dispatch）**：任务直接进入本地 DSQ，并智能选择 NUMA 节点，绕过全局共享队列，消除锁竞争。
 
-5.  **NUMA 优化的低延迟唤醒（NUMA-Optimized Low Latency Wakeups）**：实现了增强的跨 NUMA 踢核机制，对跨 NUMA 唤醒赋予更高优先级，显著降低 MPI 通信延迟。
+5. **NUMA 优化的低延迟唤醒（NUMA-Optimized Low Latency Wakeups）**：实现了增强的跨 NUMA 踢核机制，对跨 NUMA 唤醒赋予更高优先级，显著降低 MPI 通信延迟。
 
 ## 安全机制
 
 针对无限时间片可能导致的系统无响应风险（例如 HPC 任务阻塞了 SSH 守护进程），`scx_tssc` 实现了**拥塞感知安全阀（Congestion-Aware Safety Valve）**：
 
-*   **动态时间片降级**：当任务入队时，调度器会检查目标 CPU 的本地队列深度。
-    *   **独占模式**：如果队列为空，任务获得 `SCX_SLICE_INF`（无限时间片），享受极致吞吐。
-    *   **拥塞模式**：如果已有任务在排队（如系统管理进程），新任务的时间片会自动降级为有限值（`20ms`）。这确保了即使在计算节点满载的情况下，运维和管理进程依然能获得执行机会，防止机器"失联"。
+- **动态时间片降级**：当任务入队时，调度器会检查目标 CPU 的本地队列深度。
+  - **独占模式**：如果队列为空，任务获得 `SCX_SLICE_INF`（无限时间片），享受极致吞吐。
+  - **拥塞模式**：如果已有任务在排队（如系统管理进程），新任务的时间片会自动降级为有限值（`20ms`）。这确保了即使在计算节点满载的情况下，运维和管理进程依然能获得执行机会，防止机器"失联"。
 
 ## 最新改进与稳定性修复
 
@@ -79,13 +79,8 @@
 
 ### NUMA 性能影响
 
-**双路系统基准测试提升：**
-- **LINPACK**：+10-15% 性能，通过优化的内存局部性
-- **HPCG**：+15-20% 改进，得益于降低的内存延迟
-- **AI 训练**：+8-12% 更快收敛，更好的带宽利用率
-- **MPI 应用**：+5-10% 通信开销减少
-
 **NUMA 感知的 CPU 选择优先级：**
+
 1. 同 CPU（L1/L2 缓存 + 本地内存）
 2. 同 NUMA 节点（L3 缓存 + 本地内存）
 3. 不同 NUMA 节点（远程内存访问 - 慢 50%）
@@ -121,19 +116,15 @@ watch -n 1 'cat /sys/kernel/sched_ext/tssc/stats'
 ```
 
 **NUMA 性能指标：**
+
 - `tasks_local_numa`：放置在同 NUMA 节点的任务数
 - `tasks_cross_numa`：需要跨 NUMA 访问的任务数
 - `cache_hits/cache_misses`：估算的缓存效率
 - `numa_migrations`：跨 NUMA 任务迁移次数
 - `kicks_local_numa/kicks_cross_numa`：按 NUMA 分类的唤醒效率
 
-**竞赛调优建议：**
+**调优建议：**
+
 - 监控 `tasks_cross_numa` - 应该 <10% 以获得最佳性能
 - 高 `cache_misses` 表示 NUMA 放置不当
 - 平衡 `infinite_slices` 与 `congested_slices` 以兼顾公平性和吞吐量
-
-## 已知限制
-
-1.  **内存带宽**：在双路满载情况下，尽管进行了 NUMA 优化放置，内存带宽饱和仍可能是性能瓶颈。
-2.  **极端动态负载**：专为静态 HPC 工作负载设计；进程频繁创建销毁（Churn）可能导致暂时的负载不均衡。
-3.  **严格亲和性的权衡**：强 NUMA 感知粘滞性最大化性能，但当某个 NUMA 节点突然空闲时，可能延迟负载均衡的发生。

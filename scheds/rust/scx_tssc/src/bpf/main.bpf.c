@@ -256,17 +256,19 @@ void BPF_STRUCT_OPS(tssc_enqueue, struct task_struct *p, u64 enq_flags)
      * Additional kick conditions for NUMA optimization:
      * - Always kick on cross-NUMA wakeups (memory latency critical)
      * - Kick on same-NUMA if there's congestion (fairness)
+     * 
+     * CRITICAL FIX: We must kick unconditionally on wakeup.
+     * The previous logic skipped kicking for uncongested local nodes, which
+     * caused tasks to sit in the queue of idle CPUs without waking them up.
      */
     if (should_kick) {
-        if (task_node != current_node || is_congested) {
-            scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
-            
-            /* Collect kick statistics */
-            if (task_node == current_node) {
-                increment_stat(STAT_KICKS_LOCAL_NUMA);
-            } else {
-                increment_stat(STAT_KICKS_CROSS_NUMA);
-            }
+        scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
+        
+        /* Collect kick statistics */
+        if (task_node == current_node) {
+            increment_stat(STAT_KICKS_LOCAL_NUMA);
+        } else {
+            increment_stat(STAT_KICKS_CROSS_NUMA);
         }
     }
 }
@@ -294,9 +296,16 @@ void BPF_STRUCT_OPS(tssc_dispatch, s32 cpu, struct task_struct *prev)
      */
     
     /* 
-     * Optional: Add NUMA-aware load balancing here if needed
-     * For now, the built-in local DSQ consumption handles most cases efficiently.
+     * Optional: Add NUMA-aware load balancing here if needed.
      */
+    
+    /*
+     * CRITICAL FIX: Explicitly consume tasks from the local DSQ.
+     * When the .dispatch callback is implemented, the default behavior of 
+     * automatically consuming the local DSQ is overridden. We must explicitly 
+     * move tasks from the local DSQ to the execution queue.
+     */
+    scx_bpf_dsq_move_to_local(SCX_DSQ_LOCAL);
     
     /* Collect dispatch statistics for performance analysis */
     if (prev) {
