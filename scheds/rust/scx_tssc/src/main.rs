@@ -45,7 +45,7 @@ use scx_utils::UserExitInfo;
 use scx_utils::NR_CPU_IDS;
 use stats::Metrics;
 
-const SCHEDULER_NAME: &str = "scx_tickless";
+const SCHEDULER_NAME: &str = "scx_tssc";
 
 #[derive(Debug, Parser)]
 struct Opts {
