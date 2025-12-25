@@ -23,10 +23,10 @@ s32 BPF_STRUCT_OPS(tssc_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wak
      * Even if the CPU is currently busy, migrating memory cache is usually
      * more expensive than waiting a tiny bit, assuming strict partitioning.
      * 
-     * Added safety check: ensure prev_cpu is valid and not the current CPU
-     * to prevent potential infinite loops.
+     * Fixed: Removed prev_cpu != current_cpu check which broke locality
+     * when waking up on the same CPU.
      */
-    if (prev_cpu >= 0 && prev_cpu != current_cpu && 
+    if (prev_cpu >= 0 && 
         bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr)) {
         return prev_cpu;
     }
@@ -97,9 +97,13 @@ void BPF_STRUCT_OPS(tssc_enqueue, struct task_struct *p, u64 enq_flags)
      * Kick when:
      * 1. Enqueuing to a different CPU
      * 2. This is a wakeup operation
-     * 3. The target CPU is congested (indicating it might be stalled)
+     * 
+     * Fixed: Removed 'is_congested' check. We MUST kick on wakeup even if the queue 
+     * looked empty (nr_queued==0), because there might be a task currently RUNNING 
+     * with an infinite slice. If we don't kick, that running task won't be preempted, 
+     * and this new task will starve ("First Waiter Starvation").
      */
-    if (cpu != current_cpu && (enq_flags & SCX_ENQ_WAKEUP) && is_congested) {
+    if (cpu != current_cpu && (enq_flags & SCX_ENQ_WAKEUP)) {
         scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
     }
 }
