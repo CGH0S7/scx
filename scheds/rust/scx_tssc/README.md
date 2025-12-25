@@ -9,9 +9,10 @@
 Drawing inspiration from `scx_rusty` (structure) and `scx_tickless` (noise reduction), `scx_tssc` adopts a robust "set it and forget it" approach for HPC jobs:
 
 1.  **Strict Affinity**: Once a task is placed on a CPU, it stays there. Migration is disabled to preserve L1/L2 cache warmth.
-2.  **Infinite Time Slices (Adaptive)**: By default, tasks are given `SCX_SLICE_INF`, disabling tick-based preemption. This ensures compute kernels run uninterrupted by the OS scheduler.
-3.  **Local Dispatch**: Tasks are enqueued directly to local per-CPU DSQs (`SCX_DSQ_LOCAL_ON`), bypassing global shared queues to eliminate contention.
-4.  **Low Latency Wakeups**: Implements direct CPU kicking (`SCX_KICK_PREEMPT`) for remote wakeups to minimize MPI communication latency.
+2.  **SMT & Dual-Socket Optimization**: Prioritizes fully idle physical cores (`SCX_PICK_IDLE_CORE`) for new tasks. This prevents AVX-512 throttling by avoiding Hyper-Threading contention until all physical cores are utilized.
+3.  **Infinite Time Slices (Adaptive)**: By default, tasks are given `SCX_SLICE_INF`, disabling tick-based preemption. This ensures compute kernels run uninterrupted by the OS scheduler.
+4.  **Local Dispatch**: Tasks are enqueued directly to local per-CPU DSQs (`SCX_DSQ_LOCAL_ON`), bypassing global shared queues to eliminate contention.
+5.  **Low Latency Wakeups**: Implements direct CPU kicking (`SCX_KICK_PREEMPT`) for remote wakeups to minimize MPI communication latency.
 
 ## Safety Mechanisms
 
@@ -75,6 +76,6 @@ journalctl -t scx_tssc
 
 ## Known Limitations
 
-1. **NUMA Awareness**: Current version focuses on single-node performance
-2. **SMT Optimization**: Basic SMT handling, could be enhanced for hyper-threading scenarios
-3. **Dynamic Load Balancing**: Designed for static HPC workloads, not ideal for highly dynamic environments
+1.  **Memory Bandwidth**: On saturated dual-socket systems, memory bandwidth saturation may still occur despite optimized placement.
+2.  **Extremely Dynamic Workloads**: Designed for static HPC workloads; highly volatile process churn might cause temporary imbalances.
+3.  **Strict Affinity Trade-off**: Strong stickiness is good for cache but might delay load balancing if a node becomes unexpectedly free.

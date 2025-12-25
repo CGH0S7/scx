@@ -33,7 +33,20 @@ s32 BPF_STRUCT_OPS(tssc_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wak
 
     /*
      * 2. NEW PLACEMENT: If it's a new task (or forced migration), pick an IDLE core.
-     * We prefer physical cores to avoid SMT contention if possible.
+     * 
+     * Optimization for SMT/Dual-Socket:
+     * Step A: Try to find a fully idle PHYSICAL CORE (SCX_PICK_IDLE_CORE).
+     * This ensures we don't schedule two HPC tasks on the same physical core 
+     * (siblings) unless necessary, avoiding AVX-512 throttling/contention.
+     */
+    cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, SCX_PICK_IDLE_CORE);
+    if (cpu >= 0) {
+        return cpu;
+    }
+
+    /*
+     * Step B: If no full physical core is idle, take ANY idle logical core (SMT sibling).
+     * Better to run on a sibling than wait in queue.
      */
     cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
     if (cpu >= 0) {
