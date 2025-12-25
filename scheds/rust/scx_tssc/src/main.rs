@@ -117,8 +117,46 @@ fn main() -> Result<()> {
         r.store(false, Ordering::SeqCst);
     }).expect("Error setting Ctrl-C handler");
 
+    let stats_map = &skel.maps.stats;
+    let mut last_print = std::time::Instant::now();
+
+    // Stats indices matching BPF enum
+    const STAT_TASKS_LOCAL_NUMA: u32 = 0;
+    const STAT_TASKS_CROSS_NUMA: u32 = 1;
+    const STAT_KICKS_LOCAL_NUMA: u32 = 2;
+    const STAT_KICKS_CROSS_NUMA: u32 = 3;
+    const STAT_CONGESTED_SLICES: u32 = 4;
+    const STAT_INFINITE_SLICES: u32 = 5;
+
+    let stats_to_print = [
+        (STAT_TASKS_LOCAL_NUMA, "Local NUMA Tasks"),
+        (STAT_TASKS_CROSS_NUMA, "Cross NUMA Tasks"),
+        (STAT_KICKS_LOCAL_NUMA, "Local NUMA Kicks"),
+        (STAT_KICKS_CROSS_NUMA, "Cross NUMA Kicks"),
+        (STAT_CONGESTED_SLICES, "Congested Slices"),
+        (STAT_INFINITE_SLICES, "Infinite Slices "),
+    ];
+
     while running.load(Ordering::SeqCst) && !uei_exited!(&skel, uei) {
-        std::thread::sleep(std::time::Duration::from_millis(1000));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        
+        if last_print.elapsed() >= std::time::Duration::from_secs(1) {
+            println!("\n--- scx_tssc statistics ---");
+            for (idx, name) in stats_to_print {
+                let key = idx.to_ne_bytes();
+                // Read per-cpu values
+                if let Ok(Some(values)) = stats_map.lookup_percpu(&key, MapFlags::ANY) {
+                    let mut total: u64 = 0;
+                    for val_bytes in values {
+                        if val_bytes.len() == 8 {
+                            total += u64::from_ne_bytes(val_bytes.try_into().unwrap());
+                        }
+                    }
+                    println!("{}: {}", name, total);
+                }
+            }
+            last_print = std::time::Instant::now();
+        }
     }
 
     uei_report!(&skel, uei)?;
