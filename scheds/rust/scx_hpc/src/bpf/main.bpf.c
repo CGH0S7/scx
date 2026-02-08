@@ -380,7 +380,7 @@ void BPF_STRUCT_OPS(hpc_enqueue, struct task_struct *p, u64 enq_flags)
 	 * dispatch locally with a bounded slice so it can run on that
 	 * compute CPU without starving in SERVICE_DSQ.
 	 */
-	if ((enq_flags & SCX_ENQ_MIGRATION_DISABLED) &&
+	if ((enq_flags & SCX_OPS_ENQ_MIGRATION_DISABLED) &&
 	    is_compute_cpu(scx_bpf_task_cpu(p))) {
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, service_slice_ns,
 				    enq_flags);
