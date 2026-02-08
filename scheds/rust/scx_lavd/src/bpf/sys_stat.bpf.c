@@ -7,6 +7,7 @@
 #include <scx/common.bpf.h>
 #include "intf.h"
 #include "lavd.bpf.h"
+#include "power.bpf.h"
 #include <errno.h>
 #include <stdbool.h>
 #include <bpf/bpf_core_read.h>
@@ -73,8 +74,12 @@ struct sys_stat_ctx {
 	u32		cur_sc_util;
 };
 
-static void init_sys_stat_ctx(struct sys_stat_ctx *c)
+static struct sys_stat_ctx ctx;
+
+static void init_sys_stat_ctx(void)
 {
+	struct sys_stat_ctx *c = &ctx;
+
 	__builtin_memset(c, 0, sizeof(*c));
 
 	c->min_perf_cri = LAVD_SCALE;
@@ -83,10 +88,11 @@ static void init_sys_stat_ctx(struct sys_stat_ctx *c)
 	WRITE_ONCE(sys_stat.last_update_clk, c->now);
 }
 
-static void collect_sys_stat(struct sys_stat_ctx *c)
+static void collect_sys_stat(void)
 {
+	struct sys_stat_ctx *c = &ctx;
 	struct cpdom_ctx *cpdomc;
-	u64 cpdom_id, cpuc_tot_sc_time, compute;
+	u64 cpdom_id, compute = 1;
 	int cpu;
 
 	/*
@@ -127,12 +133,13 @@ static void collect_sys_stat(struct sys_stat_ctx *c)
 	/*
 	 * Collect statistics for each CPU (phase 1).
 	 *
-	 * Note that we divide the loop into phases 1 and 2 to lower the
+	 * Note that we divide the loop into multiple phases to lower the
 	 * verification burden and to avoid a verification error. Someday,
-	 * when the verifier gets smarter, we can merge phases 1 and 2
-	 * into one.
+	 * when the verifier gets smarter, we can merge those phases into
+	 * one.
 	 */
 	bpf_for(cpu, 0, nr_cpu_ids) {
+		u64 non_scx_time, sc_non_scx_time, cpuc_tot_sc_time;
 		struct cpu_ctx *cpuc = get_cpu_ctx_id(cpu);
 		if (!cpuc) {
 			c->compute_total = 0;
@@ -157,19 +164,91 @@ static void collect_sys_stat(struct sys_stat_ctx *c)
 		cpuc->tot_svc_time = 0;
 
 		/*
-		 * Update scaled CPU utilization,
-		 * which is capacity and frequency invariant.
+		 * If the CPU is in an idle state (i.e., idle_start_clk is
+		 * non-zero), accumulate the current idle period so far.
 		 */
-		cpuc_tot_sc_time = cpuc->tot_sc_time;
-		cpuc->tot_sc_time = 0;
+		for (int i = 0; i < LAVD_MAX_RETRY; i++) {
+			u64 old_clk = cpuc->idle_start_clk;
+			if (old_clk == 0 || time_after(old_clk, c->now))
+				break;
+
+			bool ret = __sync_bool_compare_and_swap(
+					&cpuc->idle_start_clk, old_clk, c->now);
+			if (ret) {
+				u64 duration = time_delta(c->now, old_clk);
+
+				__sync_fetch_and_add(&cpuc->idle_total, duration);
+				break;
+			}
+		}
+
+		/*
+		 * Calculate per-CPU utilization.
+		 */
+		compute = time_delta(c->duration, cpuc->idle_total);
+		cpuc->cur_util = (compute << LAVD_SHIFT) / c->duration;
+		cpuc->avg_util = calc_asym_avg(cpuc->avg_util, cpuc->cur_util);
+
+		cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpuc->cpdom_id]);
+		if (cpdomc) {
+			cpdomc->cur_util_sum += cpuc->cur_util;
+			cpdomc->avg_util_sum += cpuc->avg_util;
+		}
+
+		/*
+		 * Calculate the scaled non-SCX time of this CPU, including
+		 * IRQ, non-SCX (RT/DL) tasks. Since there is no direct way
+		 * to track non-SCX time, we derive it from the total SCX task
+		 * time (i.e., tot_task_time) and total compute time (i.e.,
+		 * duration - idle_total). We assume the CPU frequency was at
+		 * its maximum while running non-SCX tasks.
+		 */
+		non_scx_time = time_delta(compute, cpuc->tot_task_time);
+		sc_non_scx_time = scale_cap_max_freq(non_scx_time, cpu);
+		cpuc->tot_task_time = 0;
+
+		/*
+		 * Update scaled CPU utilization, which is capacity and
+		 * frequency invariant. The scaled CPU utilization should
+		 * include everything — SCX task time, non-SCX task time
+		 * (RT/DL), IRQ times, etc.
+		 */
+		cpuc_tot_sc_time = cpuc->tot_sc_time + sc_non_scx_time;
 		cpuc->cur_sc_util = (cpuc_tot_sc_time << LAVD_SHIFT) / c->duration;
 		cpuc->avg_sc_util = calc_avg(cpuc->avg_sc_util, cpuc->cur_sc_util);
+		cpuc->tot_sc_time = 0;
 
 		/*
 		 * Accumulate cpus' scaled loads,
 		 * which is capacity and frequency invariant.
 		 */
 		c->tot_sc_time += cpuc_tot_sc_time;
+
+		/*
+		 * Track the scaled time when the utilization spikes happened.
+		 */
+		if (cpuc->cur_util > LAVD_CC_UTIL_SPIKE)
+			c->tsct_spike += cpuc_tot_sc_time;
+	}
+
+	/*
+	 * Collect statistics for each CPU (phase 2).
+	 */
+	bpf_for(cpu, 0, nr_cpu_ids) {
+		struct cpu_ctx *cpuc = get_cpu_ctx_id(cpu);
+		if (!cpuc) {
+			c->compute_total = 0;
+			break;
+		}
+
+		/*
+		 * Update the effective capacity of this CPU -- the capacity
+		 * that this CPU can achieve considering all the constraints,
+		 * such as policy, thermal, power, etc.
+		 *
+		 * WARNING: This should be called after updating cpuc->cur_util.
+		 */
+		update_effective_capacity(cpuc);
 
 		/*
 		 * Accumulate statistics.
@@ -207,11 +286,10 @@ static void collect_sys_stat(struct sys_stat_ctx *c)
 		if (cpuc->max_lat_cri > c->max_lat_cri)
 			c->max_lat_cri = cpuc->max_lat_cri;
 		cpuc->max_lat_cri = 0;
-
 	}
 
 	/*
-	 * Collect statistics for each CPU (phase 2).
+	 * Collect statistics for each CPU (phase 3).
 	 */
 	bpf_for(cpu, 0, nr_cpu_ids) {
 		struct cpu_ctx *cpuc = get_cpu_ctx_id(cpu);
@@ -221,7 +299,7 @@ static void collect_sys_stat(struct sys_stat_ctx *c)
 		}
 
 		/*
-		 * Accumulate task's performance criticlity information.
+		 * Accumulate task's performance criticality information.
 		 */
 		if (have_little_core) {
 			if (cpuc->min_perf_cri < c->min_perf_cri)
@@ -237,41 +315,8 @@ static void collect_sys_stat(struct sys_stat_ctx *c)
 		}
 
 		/*
-		 * If the CPU is in an idle state (i.e., idle_start_clk is
-		 * non-zero), accumulate the current idle period so far.
-		 */
-		for (int i = 0; i < LAVD_MAX_RETRY; i++) {
-			u64 old_clk = cpuc->idle_start_clk;
-			if (old_clk == 0 || time_after(old_clk, c->now))
-				break;
-
-			bool ret = __sync_bool_compare_and_swap(
-					&cpuc->idle_start_clk, old_clk, c->now);
-			if (ret) {
-				u64 duration = time_delta(c->now, old_clk);
-
-				__sync_fetch_and_add(&cpuc->idle_total, duration);
-				break;
-			}
-		}
-
-		/*
-		 * Calculate per-CPU utilization.
-		 */
-		compute = time_delta(c->duration, cpuc->idle_total);
-
-		cpuc->cur_util = (compute << LAVD_SHIFT) / c->duration;
-		cpuc->avg_util = calc_asym_avg(cpuc->avg_util, cpuc->cur_util);
-
-		cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpuc->cpdom_id]);
-		if (cpdomc) {
-			cpdomc->cur_util_sum += cpuc->cur_util;
-			cpdomc->avg_util_sum += cpuc->avg_util;
-		}
-
-		/*
 		 * cpuc->cur_stolen_est is only an estimate of the time stolen by
-		 * irq/steal during execution times. We extropolate that ratio to
+		 * irq/steal during execution times. We extrapolate that ratio to
 		 * the rest of CPU time as an approximation.
 		 */
 		cpuc->cur_stolen_est = (cpuc->stolen_time_est << LAVD_SHIFT) / compute;
@@ -283,27 +328,27 @@ static void collect_sys_stat(struct sys_stat_ctx *c)
 		 */
 		c->idle_total += cpuc->idle_total;
 		cpuc->idle_total = 0;
-
-		/*
-		 * Track the scaled time when the utilization spikes happened.
-		 */
-		if (cpuc->cur_util > LAVD_CC_UTIL_SPIKE)
-			c->tsct_spike += cpuc_tot_sc_time;
 	}
 }
 
-static void calc_sys_stat(struct sys_stat_ctx *c)
+static void calc_sys_stat(void)
 {
+	struct sys_stat_ctx *c = &ctx;
 	static int cnt = 0;
 	u64 avg_svc_time = 0, cur_sc_util, scu_spike;
 
 	/*
-	 * Calculate the CPU utilization.
+	 * Calculate the CPU utilization that includes everything
+	 * — scx tasks, non-scx tasks (e.g., RT/DL), IRQ, etc.
 	 */
 	c->duration_total = c->duration * nr_cpus_onln;
 	c->compute_total = time_delta(c->duration_total, c->idle_total);
 	c->cur_util = (c->compute_total << LAVD_SHIFT) / c->duration_total;
 
+	/*
+	 * Calculate the scaled CPU utilization that includes everything
+	 * — scx tasks, non-scx tasks (e.g., RT/DL), IRQ, etc.
+	 */
 	cur_sc_util = (c->tot_sc_time << LAVD_SHIFT) / c->duration_total;
 	if (cur_sc_util > c->cur_util)
 		cur_sc_util = min(sys_stat.avg_sc_util, c->cur_util);
@@ -436,11 +481,9 @@ static void calc_sys_time_slice(void)
 
 static int do_update_sys_stat(void)
 {
-	struct sys_stat_ctx c;
-
-	init_sys_stat_ctx(&c);
-	collect_sys_stat(&c);
-	calc_sys_stat(&c);
+	init_sys_stat_ctx();
+	collect_sys_stat();
+	calc_sys_stat();
 
 	return 0;
 }

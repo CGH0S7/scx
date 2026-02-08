@@ -7,6 +7,7 @@
 #include <scx/common.bpf.h>
 #include "intf.h"
 #include "lavd.bpf.h"
+#include "power.bpf.h"
 #include <errno.h>
 #include <stdbool.h>
 #include <bpf/bpf_core_read.h>
@@ -22,12 +23,10 @@
  */
 private(LAVD) struct bpf_cpumask __kptr *turbo_cpumask; /* CPU mask for turbo CPUs */
 private(LAVD) struct bpf_cpumask __kptr *big_cpumask; /* CPU mask for big CPUs */
-private(LAVD) struct bpf_cpumask __kptr *little_cpumask; /* CPU mask for little CPUs */
 private(LAVD) struct bpf_cpumask __kptr *active_cpumask; /* CPU mask for active CPUs */
 private(LAVD) struct bpf_cpumask __kptr *ovrflw_cpumask; /* CPU mask for overflow CPUs */
 
 const volatile u64	nr_llcs;	/* number of LLC domains */
-const volatile u64	__nr_cpu_ids;	/* maximum CPU IDs */
 volatile u64		nr_cpus_onln;	/* current number of online CPUs */
 
 const volatile u32	cpu_sibling[LAVD_CPU_ID_MAX]; /* siblings for CPUs when SMT is active */
@@ -165,6 +164,12 @@ bool test_task_flag(task_ctx __arg_arena *taskc, u64 flag)
 }
 
 __hidden
+bool test_task_flag_mask(task_ctx __arg_arena *taskc, u64 flag)
+{
+	return (taskc->flags & flag);
+}
+
+__hidden
 void set_task_flag(task_ctx __arg_arena *taskc, u64 flag)
 {
 	taskc->flags |= flag;
@@ -241,28 +246,6 @@ bool use_full_cpus(void)
 }
 
 __hidden
-s64 __attribute__ ((noinline)) pick_any_bit(u64 bitmap, u64 nuance)
-{
-	u64 shift, rotated;
-	int tz;
-
-	if (!bitmap)
-		return -ENOENT;
-
-	/* modulo nuance to [0, 63] */
-	shift = nuance & 63ULL;
-
-	/* Circular rotate the bitmap by 'shift' bits. */
-	rotated = (bitmap >> shift) | (bitmap << (64 - shift));
-
-	/* Count the number of trailing zeros in the raomdonly rotated bitmap. */
-	tz = ctzll(rotated);
-
-	/* Add the shift back and wrap around to get the original index. */
-	return (tz + shift) & 63;
-}
-
-__hidden
 void set_on_core_type(task_ctx __arg_arena *taskc,
 		      const struct cpumask *cpumask)
 {
@@ -270,7 +253,13 @@ void set_on_core_type(task_ctx __arg_arena *taskc,
 	struct cpu_ctx *cpuc;
 	int cpu;
 
-	bpf_for(cpu, 0, __nr_cpu_ids) {
+	if (!cpumask)
+		return;
+
+	bpf_for(cpu, 0, nr_cpu_ids) {
+		if (cpu >= LAVD_CPU_ID_MAX)
+			break;
+
 		if (!bpf_cpumask_test_cpu(cpu, cpumask))
 			continue;
 
@@ -341,21 +330,19 @@ u32 cpu_to_dsq(u32 cpu)
 }
 
 __hidden
-s32 nr_queued_on_cpu(struct cpu_ctx *cpuc)
+bool queued_on_cpu(struct cpu_ctx *cpuc)
 {
-	s32 nr_queued;
+	if (scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpuc->cpu_id))
+		return true;
 
-	nr_queued = scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpuc->cpu_id);
+	if (use_per_cpu_dsq() && scx_bpf_dsq_nr_queued(cpu_to_dsq(cpuc->cpu_id)))
+		return true;
 
-	if (use_per_cpu_dsq())
-		nr_queued += scx_bpf_dsq_nr_queued(cpu_to_dsq(cpuc->cpu_id));
+	if (use_cpdom_dsq() && scx_bpf_dsq_nr_queued(cpdom_to_dsq(cpuc->cpdom_id)))
+		return true;
 
-	if (use_cpdom_dsq())
-		nr_queued += scx_bpf_dsq_nr_queued(cpdom_to_dsq(cpuc->cpdom_id));
-
-	return nr_queued;
+	return false;
 }
-
 __hidden
 u64 get_target_dsq_id(struct task_struct *p, struct cpu_ctx *cpuc)
 {

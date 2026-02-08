@@ -16,6 +16,23 @@
  */
 #define MAX_WAKEUP_FREQ		64ULL
 
+/*
+ * Return true if @cpu is valid, false otherwise.
+ */
+#define IS_CPU_VALID(__cpu) ((__cpu) >= 0 && (__cpu) < MAX_CPUS)
+
+/*
+ * Return the LLC id associated to a CPU, or -1 if the CPU is invalid.
+ */
+#define CPU_LLC_ID(__cpu) \
+	(IS_CPU_VALID(__cpu) ? cpu_llc_id(__cpu) : -1)
+
+/*
+ * Return the capacity of a CPU, or -1 if the CPU is invalid.
+ */
+#define CPU_CAPACITY(__cpu) \
+	(IS_CPU_VALID(__cpu) ? cpu_capacity[__cpu] : -1)
+
 char _license[] SEC("license") = "GPL";
 
 UEI_DEFINE(uei);
@@ -43,6 +60,16 @@ static u64 nr_cpu_ids;
  * CPUs in the system have SMT is enabled.
  */
 const volatile bool smt_enabled = true;
+
+/*
+ * User CPU utilization threshold to determine when the system is busy.
+ */
+const volatile u64 busy_threshold;
+
+/*
+ * Current global CPU utilization percentage in the range [0 .. 1024].
+ */
+volatile u64 cpu_util;
 
 /*
  * Subset of CPUs to prioritize.
@@ -156,6 +183,15 @@ static bool is_task_sticky(const struct task_ctx *tctx)
 }
 
 /*
+ * Return true if the system is considered busy (user CPU utilization is
+ * above the threshold), false otherwise.
+ */
+static inline bool is_system_busy(void)
+{
+	return cpu_util >= busy_threshold;
+}
+
+/*
  * Exponential weighted moving average (EWMA).
  *
  * Copied from scx_lavd. Returns the new average as:
@@ -183,10 +219,9 @@ static u64 update_freq(u64 freq, u64 interval)
 }
 
 /*
- * Evaluate the task's time slice proportionally to its weight and
- * inversely proportional to the amount of contending tasks.
+ * Evaluate the task's time slice proportionally to its weight.
  */
-static u64 task_slice(struct task_struct *p, s32 cpu)
+static u64 task_slice(struct task_struct *p)
 {
 	return scale_by_task_weight(p, slice_ns);
 }
@@ -221,19 +256,6 @@ static u64 task_dl(struct task_struct *p, struct task_ctx *tctx)
 }
 
 /*
- * Return true if @cpu is valid, otherwise trigger an error and return
- * false.
- */
-static inline bool is_cpu_valid(s32 cpu)
-{
-	if (cpu < 0 || cpu >= MAX_CPUS) {
-		scx_bpf_error("invalid CPU id: %d", cpu);
-		return false;
-	}
-	return true;
-}
-
-/*
  * Return true if @this_cpu and @that_cpu are in the same LLC, false
  * otherwise.
  */
@@ -242,10 +264,7 @@ static inline bool cpus_share_cache(s32 this_cpu, s32 that_cpu)
         if (this_cpu == that_cpu)
                 return true;
 
-	if (!is_cpu_valid(this_cpu) || !is_cpu_valid(that_cpu))
-		return false;
-
-	return cpu_llc_id(this_cpu) == cpu_llc_id(that_cpu);
+	return CPU_LLC_ID(this_cpu) == CPU_LLC_ID(that_cpu);
 }
 
 /*
@@ -256,10 +275,7 @@ static inline bool is_cpu_faster(s32 this_cpu, s32 that_cpu)
         if (this_cpu == that_cpu)
                 return false;
 
-	if (!is_cpu_valid(this_cpu) || !is_cpu_valid(that_cpu))
-		return false;
-
-	return cpu_capacity[this_cpu] > cpu_capacity[that_cpu];
+	return CPU_CAPACITY(this_cpu) > CPU_CAPACITY(that_cpu);
 }
 
 /*
@@ -312,21 +328,6 @@ static bool is_smt_contended(s32 cpu)
 }
 
 /*
- * Return true if all the CPUs in the system are busy, false otherwise.
- */
-static bool is_system_busy(void)
-{
-	const struct cpumask *idle_mask;
-	bool is_busy;
-
-	idle_mask = scx_bpf_get_idle_cpumask();
-	is_busy = bpf_cpumask_empty(idle_mask);
-	scx_bpf_put_cpumask(idle_mask);
-
-	return is_busy;
-}
-
-/*
  * Return true if we should attempt a task migration to an idle CPU from
  * ops.enqueue(), false otherwise.
  *
@@ -335,17 +336,6 @@ static bool is_system_busy(void)
  */
 static bool try_migrate(const struct task_struct *p, s32 prev_cpu, u64 enq_flags)
 {
-	if (is_pcpu_task(p))
-		return false;
-
-	/*
-	 * Always attempt to migrate to a different CPU if the task was
-	 * re-enqueued due to a higher scheduling class stealing the CPU it
-	 * was using or queued on.
-	 */
-	if (enq_flags & SCX_ENQ_REENQ)
-		return true;
-
 	/*
 	 * Migrate if ops.select_cpu() was skipped and one of the following
 	 * conditions is true:
@@ -354,7 +344,7 @@ static bool try_migrate(const struct task_struct *p, s32 prev_cpu, u64 enq_flags
 	 *  - SMT is enabled and the SMT core is contended by other tasks.
 	 */
 	return (!scx_bpf_task_running(p) && !__COMPAT_is_enq_cpu_selected(enq_flags)) ||
-	       scx_bpf_dsq_nr_queued(prev_cpu) ||
+	       __COMPAT_scx_bpf_dsq_peek(prev_cpu) ||
 	       is_smt_contended(prev_cpu);
 }
 
@@ -374,22 +364,9 @@ static bool keep_running(const struct task_struct *p, s32 cpu)
 	 * Do not keep running if the CPU is not in the primary domain and
 	 * the task can use the primary domain).
 	 */
-	if (primary && bpf_cpumask_intersects(primary, p->cpus_ptr) &&
+	if (!primary_all && primary &&
+	    bpf_cpumask_intersects(primary, p->cpus_ptr) &&
 	    !bpf_cpumask_test_cpu(cpu, primary))
-		return false;
-
-	/*
-	 * If the task can only run on this CPU, keep it running.
-	 */
-	if (is_pcpu_task(p))
-		return true;
-
-	/*
-	 * If the task is not running in a full-idle SMT core and there are
-	 * full-idle SMT cores available in the system, give it a chance to
-	 * migrate elsewhere.
-	 */
-	if (is_smt_contended(cpu))
 		return false;
 
 	return true;
@@ -631,26 +608,50 @@ static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, s32 this_cpu, u64 
 }
 
 /*
+ * Return true if @p can run on @cpu, false otherwise.
+ */
+static bool is_cpu_allowed(const struct task_struct *p, s32 cpu)
+{
+	return p->nr_cpus_allowed == nr_cpu_ids ||
+	       bpf_cpumask_test_cpu(cpu, p->cpus_ptr);
+}
+
+/*
+ * Dispatch task @p directly to @cpu, bypassing the scheduler queues.
+ */
+static s32 do_direct_dispatch(struct task_struct *p, s32 cpu)
+{
+	struct task_struct *q;
+	struct task_ctx *tctx;
+	u64 dl;
+
+	tctx = try_lookup_task_ctx(p);
+	if (!tctx)
+		return cpu;
+	dl = task_dl(p, tctx);
+
+	/*
+	 * If there's no task waiting for the target CPU or if the first
+	 * waiting task has a later deadline, dispatch to the local DSQ to
+	 * save some locking overhead.
+	 */
+	q = __COMPAT_scx_bpf_dsq_peek(cpu);
+	if (!q || q->scx.dsq_vtime >= dl)
+		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, task_slice(p), 0);
+	else
+		scx_bpf_dsq_insert_vtime(p, cpu, task_slice(p), dl, 0);
+
+	return cpu;
+}
+
+/*
  * Called on task wakeup to give the task a chance to migrate to an idle
  * CPU.
  */
 s32 BPF_STRUCT_OPS(beerland_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 {
 	s32 cpu, this_cpu = bpf_get_smp_processor_id();
-	bool is_this_cpu_allowed = bpf_cpumask_test_cpu(this_cpu, p->cpus_ptr);
-	struct task_ctx *tctx;
-
-	tctx = try_lookup_task_ctx(p);
-	if (!tctx)
-		return prev_cpu;
-
-	/*
-	 * Make sure @prev_cpu is usable, otherwise try to move close to
-	 * the waker's CPU. If the waker's CPU is also not usable, then
-	 * pick the first usable CPU.
-	 */
-	if (!bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr))
-		prev_cpu = is_this_cpu_allowed ? this_cpu : bpf_cpumask_first(p->cpus_ptr);
+	bool is_this_cpu_allowed = is_cpu_allowed(p, this_cpu);
 
 	/*
 	 * On wakeup if the waker's CPU is faster than the wakee's CPU, try
@@ -663,11 +664,10 @@ s32 BPF_STRUCT_OPS(beerland_select_cpu, struct task_struct *p, s32 prev_cpu, u64
 		 * same LLC and the wakee's CPU is a fully idle SMT core,
 		 * don't migrate.
 		 */
-		if (cpus_share_cache(this_cpu, prev_cpu) &&
-		    (!is_smt_contended(prev_cpu)) && scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
-			cpu = prev_cpu;
-			goto out_insert;
-		}
+		if (is_cpu_allowed(p, prev_cpu) &&
+		    cpus_share_cache(this_cpu, prev_cpu) &&
+		    (!is_smt_contended(prev_cpu)) && scx_bpf_test_and_clear_cpu_idle(prev_cpu))
+			return do_direct_dispatch(p, prev_cpu);
 
 		prev_cpu = this_cpu;
 	}
@@ -677,24 +677,10 @@ s32 BPF_STRUCT_OPS(beerland_select_cpu, struct task_struct *p, s32 prev_cpu, u64
 	 * found, keep using the same one.
 	 */
 	cpu = pick_idle_cpu(p, prev_cpu, this_cpu, wake_flags);
-	if (cpu < 0)
-		cpu = prev_cpu;
+	if (cpu >= 0 || !is_system_busy())
+		return do_direct_dispatch(p, cpu >= 0 ? cpu : prev_cpu);
 
-out_insert:
-	/*
-	 * Always dispatch directly to the target CPU, since the task will
-	 * always use its assigned per-CPU DSQ and we can save some
-	 * runqueue locking contention dispatching from here.
-	 *
-	 * The target CPU is automatically kicked when returning from this
-	 * callback.
-	 */
-	if (is_task_sticky(tctx))
-		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, task_slice(p, cpu), 0);
-	else
-		scx_bpf_dsq_insert_vtime(p, cpu, task_slice(p, cpu), task_dl(p, tctx), 0);
-
-	return cpu;
+	return prev_cpu;
 }
 
 /*
@@ -703,7 +689,7 @@ out_insert:
  */
 void BPF_STRUCT_OPS(beerland_enqueue, struct task_struct *p, u64 enq_flags)
 {
-	s32 cpu, prev_cpu = task_cpu(p, scx_bpf_task_cpu(p));
+	s32 prev_cpu = task_cpu(p, scx_bpf_task_cpu(p));
 	struct task_ctx *tctx;
 
 	tctx = try_lookup_task_ctx(p);
@@ -711,27 +697,46 @@ void BPF_STRUCT_OPS(beerland_enqueue, struct task_struct *p, u64 enq_flags)
 		return;
 
 	if (is_task_sticky(tctx)) {
-		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, task_slice(p, prev_cpu), enq_flags);
+		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, task_slice(p), enq_flags);
 	} else {
+		struct task_struct *q;
+
 		/*
 		 * Attempt a migration to an idle CPU if possible.
 		 */
 		if (try_migrate(p, prev_cpu, enq_flags)) {
-			cpu = pick_idle_cpu(p, prev_cpu, -ENOENT, 0);
+			s32 cpu;
+
+			if (is_pcpu_task(p))
+				cpu = scx_bpf_test_and_clear_cpu_idle(prev_cpu) ? prev_cpu : -EBUSY;
+			else
+				cpu = pick_idle_cpu(p, prev_cpu, -ENOENT, 0);
+
 			if (cpu >= 0) {
-				scx_bpf_dsq_insert_vtime(p, cpu, task_slice(p, prev_cpu),
-							 task_dl(p, tctx), enq_flags);
-				if (prev_cpu != cpu || !scx_bpf_task_running(p))
-					scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
-				return;
+				struct task_struct *q = __COMPAT_scx_bpf_dsq_peek(cpu);
+
+				if (!q || p->scx.dsq_vtime < q->scx.dsq_vtime) {
+					scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu,
+							   task_slice(p), enq_flags);
+					if (prev_cpu != cpu || !scx_bpf_task_running(p))
+						scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+					return;
+				}
+				prev_cpu = cpu;
 			}
 		}
 
 		/*
 		 * Keep running on the same CPU.
 		 */
-		scx_bpf_dsq_insert_vtime(p, prev_cpu, task_slice(p, prev_cpu),
-					 task_dl(p, tctx), enq_flags);
+		q = __COMPAT_scx_bpf_cpu_curr(prev_cpu);
+		if (!q) {
+			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | prev_cpu,
+					   task_slice(p), enq_flags);
+		} else {
+			scx_bpf_dsq_insert_vtime(p, prev_cpu, task_slice(p),
+						 task_dl(p, tctx), enq_flags);
+		}
 	}
 	if (!__COMPAT_is_enq_cpu_selected(enq_flags))
 		scx_bpf_kick_cpu(prev_cpu, SCX_KICK_IDLE);
@@ -771,10 +776,7 @@ static bool dispatch_from_any_cpu(s32 from_cpu)
 void BPF_STRUCT_OPS(beerland_dispatch, s32 cpu, struct task_struct *prev)
 {
 	/*
-	 * Try to consume a task from a remote CPU.
-	 *
-	 * Do not trigger any rebalance unless the system is completely
-	 * saturated.
+	 * Immediately trigger a rebalance if the system is busy.
 	 */
 	if (is_system_busy() && dispatch_from_any_cpu(cpu)) {
 		__sync_fetch_and_add(&nr_remote_dispatch, 1);
@@ -790,11 +792,19 @@ void BPF_STRUCT_OPS(beerland_dispatch, s32 cpu, struct task_struct *prev)
 	}
 
 	/*
+	 * Try to consume a task from a remote CPU.
+	 */
+	if (dispatch_from_any_cpu(cpu)) {
+		__sync_fetch_and_add(&nr_remote_dispatch, 1);
+		return;
+	}
+
+	/*
 	 * If no other task is contending the CPU and the previous task
 	 * still wants to run, let it run by refilling its time slice.
 	 */
 	if (prev && keep_running(prev, cpu)) {
-		prev->scx.slice = task_slice(prev, cpu);
+		prev->scx.slice = task_slice(prev);
 		__sync_fetch_and_add(&nr_keep_running, 1);
 	}
 }
@@ -869,16 +879,6 @@ void BPF_STRUCT_OPS(beerland_stopping, struct task_struct *p, bool runnable)
 	tctx->awake_vtime += vslice;
 }
 
-void BPF_STRUCT_OPS(beerland_cpu_release, s32 cpu, struct scx_cpu_release_args *args)
-{
-	/*
-	 * A higher scheduler class stole the CPU, re-enqueue all the tasks
-	 * that are waiting on this CPU and give them a chance to pick
-	 * another idle CPU.
-	 */
-	scx_bpf_reenqueue_local();
-}
-
 void BPF_STRUCT_OPS(beerland_enable, struct task_struct *p)
 {
 	p->scx.dsq_vtime = vtime_now;
@@ -932,7 +932,6 @@ SCX_OPS_DEFINE(beerland_ops,
 	       .runnable		= (void *)beerland_runnable,
 	       .running			= (void *)beerland_running,
 	       .stopping		= (void *)beerland_stopping,
-	       .cpu_release		= (void *)beerland_cpu_release,
 	       .enable			= (void *)beerland_enable,
 	       .init_task		= (void *)beerland_init_task,
 	       .init			= (void *)beerland_init,

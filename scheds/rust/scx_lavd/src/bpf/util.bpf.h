@@ -2,14 +2,7 @@
 #ifndef __UTIL_H
 #define __UTIL_H
 
-extern struct bpf_cpumask __kptr *turbo_cpumask; /* CPU mask for turbo CPUs */
-extern struct bpf_cpumask __kptr *big_cpumask; /* CPU mask for big CPUs */
-extern struct bpf_cpumask __kptr *little_cpumask; /* CPU mask for little CPUs */
-extern struct bpf_cpumask __kptr *active_cpumask; /* CPU mask for active CPUs */
-extern struct bpf_cpumask __kptr *ovrflw_cpumask; /* CPU mask for overflow CPUs */
-
 extern const volatile u64	nr_llcs;	/* number of LLC domains */
-extern const volatile u64	__nr_cpu_ids;	/* maximum CPU IDs */
 extern volatile u64		nr_cpus_onln;	/* current number of online CPUs */
 
 extern const volatile u32	cpu_sibling[LAVD_CPU_ID_MAX]; /* siblings for CPUs when SMT is active */
@@ -37,6 +30,7 @@ extern char uei_dump[];
 extern const volatile u32 uei_dump_len;
 
 u64 calc_avg_freq(u64 old_freq, u64 interval);
+u32 calc_avg32(u32 old_val, u32 new_val);
 bool is_kernel_task(struct task_struct *p);
 bool is_kernel_worker(struct task_struct *p);
 bool is_ksoftirqd(struct task_struct *p);
@@ -47,4 +41,8 @@ bool prob_x_out_of_y(u32 x, u32 y);
 u32 get_primary_cpu(u32 cpu);
 u64 task_exec_time(struct task_struct __arg_trusted *p);
 
+static inline bool rt_or_dl_task(struct task_struct *p)
+{
+	return unlikely(p->prio < MAX_RT_PRIO);
+}
 #endif /* __UTIL_H */

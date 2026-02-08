@@ -2,6 +2,11 @@
 
 #define NR_CPU_IDS_UNINIT (~(u32)0)
 
+/* For userspace programs, __arena is a no-op. */
+#if !defined(__arena) &&  !defined(__BPF__)
+#define __arena
+#endif
+
 struct arena_init_args {
 	u64 static_pages;
 	u64 task_ctx_size;

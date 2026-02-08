@@ -181,10 +181,12 @@
  * Author: Changwoo Min <changwoo@igalia.com>
  */
 #include <scx/common.bpf.h>
-#include <scx/bpf_arena_common.bpf.h>
+#include <bpf_arena_common.bpf.h>
+#include <bpf_experimental.h>
 #include "intf.h"
 #include "lavd.bpf.h"
 #include "util.bpf.h"
+#include "power.bpf.h"
 #include <errno.h>
 #include <stdbool.h>
 #include <bpf/bpf_core_read.h>
@@ -476,8 +478,9 @@ static void account_task_runtime(struct task_struct *p,
 	runtime = exec_delta;
 
 	svc_time = runtime / p->scx.weight;
-	sc_time = scale_cap_freq(runtime, cpuc->cpu_id);
+	sc_time = scale_cap_freq(runtime, cpuc);
 
+	WRITE_ONCE(cpuc->tot_task_time, cpuc->tot_task_time + task_time);
 	WRITE_ONCE(cpuc->tot_svc_time, cpuc->tot_svc_time + svc_time);
 	WRITE_ONCE(cpuc->tot_sc_time, cpuc->tot_sc_time + sc_time);
 
@@ -519,12 +522,6 @@ static void update_stat_for_stopping(struct task_struct *p,
 	taskc->last_slice_used = time_delta(now, taskc->last_running_clk);
 
 	/*
-	 * Reset waker's latency criticality here to limit the latency boost of
-	 * a task. A task will be latency-boosted only once after wake-up.
-	 */
-	taskc->lat_cri_waker = 0;
-
-	/*
 	 * Update the current service time if necessary.
 	 */
 	if (READ_ONCE(cur_svc_time) < taskc->svc_time)
@@ -564,16 +561,42 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 		.cpuc_cur = get_cpu_ctx(),
 		.wake_flags = wake_flags,
 	};
+	struct task_struct *waker;
 	bool found_idle = false;
 	s32 cpu_id;
 
 	if (!ictx.taskc || !ictx.cpuc_cur)
 		return prev_cpu;
 
+	/*
+	 * Check whether it is a synchronous wake-up to boost
+	 * latency-criticality later.
+	 */
 	if (wake_flags & SCX_WAKE_SYNC)
 		set_task_flag(ictx.taskc, LAVD_FLAG_IS_SYNC_WAKEUP);
 	else
 		reset_task_flag(ictx.taskc, LAVD_FLAG_IS_SYNC_WAKEUP);
+
+	/*
+	 * Check whether the task is woken by an interrupt handler (either the
+	 * top or bottom half) to boost its latency-criticality later.
+	 *
+	 * WARNING: bpf_in_nmi/task/hardirq/serving_softirq() is supported only
+	 * in x86 and arm64. On the unsupported architectures (e.g., s390x),
+	 * it will always return 0. So, never use !bpf_in_xxx() and keep the
+	 * logic below optional. See more details in below link:
+	 *  - https://lore.kernel.org/bpf/20260124132706.183681-2-changwoo@igalia.com/T/#u
+	 */
+	if (unlikely((bpf_in_hardirq() || bpf_in_nmi()) &&
+		     !bpf_in_serving_softirq())) {
+		set_task_flag(ictx.taskc, LAVD_FLAG_WOKEN_BY_HARDIRQ);
+		reset_task_flag(ictx.taskc, LAVD_FLAG_WOKEN_BY_SOFTIRQ);
+	} else if (unlikely(bpf_in_serving_softirq() ||
+			    ((waker = bpf_get_current_task_btf()) &&
+			     is_ksoftirqd(waker)))) {
+		set_task_flag(ictx.taskc, LAVD_FLAG_WOKEN_BY_SOFTIRQ);
+		reset_task_flag(ictx.taskc, LAVD_FLAG_WOKEN_BY_HARDIRQ);
+	}
 
 	/*
 	 * Find an idle cpu and reserve it since the task @p will run
@@ -599,7 +622,7 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 			goto out;
 		}
 
-		if (!nr_queued_on_cpu(cpuc)) {
+		if (!queued_on_cpu(cpuc)) {
 			p->scx.dsq_vtime = calc_when_to_run(p, ictx.taskc);
 			p->scx.slice = LAVD_SLICE_MAX_NS_DFL;
 			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, p->scx.slice, 0);
@@ -686,7 +709,7 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 	 * let's use the chosen CPU.
 	 */
 	task_cpu = scx_bpf_task_cpu(p);
-	if (!__COMPAT_is_enq_cpu_selected(enq_flags)) {
+	if (likely(!__COMPAT_is_enq_cpu_selected(enq_flags))) {
 		struct pick_ctx ictx = {
 			.p = p,
 			.taskc = taskc,
@@ -697,7 +720,7 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 
 		cpu = pick_idle_cpu(&ictx, &is_idle);
 	} else {
-		cpu = scx_bpf_task_cpu(p);
+		cpu = task_cpu;
 		is_idle = test_task_flag(taskc, LAVD_FLAG_IDLE_CPU_PICKED);
 		reset_task_flag(taskc, LAVD_FLAG_IDLE_CPU_PICKED);
 	}
@@ -709,6 +732,12 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 	}
 	taskc->suggested_cpu_id = cpu;
 	taskc->cpdom_id = cpuc->cpdom_id;
+
+	/*
+	 * Clean up migration flags since the task placement decision was made.
+	 */
+	if (unlikely(test_task_flag_mask(taskc, LAVD_MASK_MIGRATION)))
+		reset_task_flag(taskc, LAVD_MASK_MIGRATION);
 
 	/*
 	 * Under the CPU bandwidth control with cpu.max, check if the cgroup
@@ -748,7 +777,7 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 	 * When pinned_slice_ns is enabled, pinned tasks always use per-CPU DSQ
 	 * to enable vtime comparison across DSQs during dispatch.
 	 */
-	if (is_idle && !nr_queued_on_cpu(cpuc)) {
+	if (is_idle && !queued_on_cpu(cpuc)) {
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, p->scx.slice,
 				   enq_flags);
 	} else {
@@ -845,6 +874,51 @@ void BPF_STRUCT_OPS(lavd_dequeue, struct task_struct *p, u64 deq_flags)
 		debugln("Failed to cancel task %d with %d", p->pid, ret);
 }
 
+
+__hidden __attribute__ ((noinline))
+void consume_prev(struct task_struct *prev, task_ctx *taskc_prev, struct cpu_ctx *cpuc)
+{
+	if (!prev || !(prev->scx.flags & SCX_TASK_QUEUED))
+		return;
+
+	taskc_prev = taskc_prev ?: get_task_ctx(prev);
+	if (!taskc_prev)
+		return;
+
+	/*
+	 * Let's update stats first before calculating time slice.
+	 */
+	update_stat_for_refill(prev, taskc_prev, cpuc);
+
+	/*
+	 * Under the CPU bandwidth control with cpu.max,
+	 * check if the cgroup is throttled before executing
+	 * the task.
+	 */
+	if (enable_cpu_bw && (prev->pid != lavd_pid) &&
+		(cgroup_throttled(prev, taskc_prev, false) == -EAGAIN))
+		return;
+
+	/*
+	 * Refill the time slice.
+	 */
+	prev->scx.slice = calc_time_slice(taskc_prev, cpuc);
+
+	/*
+	 * Reset prev task's lock and futex boost count
+	 * for a lock holder to be boosted only once.
+	 */
+	if (is_lock_holder_running(cpuc))
+		reset_lock_futex_boost(taskc_prev, cpuc);
+
+	/*
+	 * Task flags can be updated when calculating the time
+	 * slice (LAVD_FLAG_SLICE_BOOST), so let's update the
+	 * CPU's copy of the flag as well.
+	 */
+	cpuc->flags = taskc_prev->flags;
+}
+
 void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 {
 	struct bpf_cpumask *active, *ovrflw;
@@ -878,8 +952,11 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 	 * to make system-wide forward progress.
 	 */
 	if (prev && (prev->scx.flags & SCX_TASK_QUEUED) &&
-	    is_lock_holder_running(cpuc))
-		goto consume_prev;
+	    is_lock_holder_running(cpuc)) {
+		consume_prev(prev, NULL, cpuc);
+		return;
+	}
+
 
 	/*
 	 * If all CPUs are using, directly consume without checking CPU masks.
@@ -896,7 +973,8 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 	ovrflw = ovrflw_cpumask;
 	if (!active || !ovrflw) {
 		scx_bpf_error("Failed to prepare cpumasks.");
-		goto unlock_out;
+		bpf_rcu_read_unlock();
+		return;
 	}
 
 	/*
@@ -959,8 +1037,11 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 	 * If there is nothing to run on per-CPU DSQ and we do not use
 	 * per-domain DSQ, there is nothing to do. So, stop here.
 	 */
-	if (!use_cpdom_dsq())
-		goto unlock_out;
+	if (!use_cpdom_dsq()) {
+		bpf_rcu_read_unlock();
+		return;
+	}
+
 	/* NOTE: We use per-domain DSQ. */
 
 	/*
@@ -1044,7 +1125,6 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 		bpf_task_release(p);
 	}
 
-unlock_out:
 	bpf_rcu_read_unlock();
 
 	/*
@@ -1063,44 +1143,7 @@ consume_out:
 	/*
 	 * If nothing to run, continue running the previous task.
 	 */
-	if (prev && prev->scx.flags & SCX_TASK_QUEUED) {
-consume_prev:
-		taskc_prev = taskc_prev ?: get_task_ctx(prev);
-		if (taskc_prev) {
-			/*
-			 * Let's update stats first before calculating time slice.
-			 */
-			update_stat_for_refill(prev, taskc_prev, cpuc);
-
-			/*
-			 * Under the CPU bandwidth control with cpu.max,
-			 * check if the cgroup is throttled before executing
-			 * the task.
-			 */
-			if (enable_cpu_bw && (prev->pid != lavd_pid) &&
-			    (cgroup_throttled(prev, taskc_prev, false) == -EAGAIN))
-				return;
-
-			/*
-			 * Refill the time slice.
-			 */
-			prev->scx.slice = calc_time_slice(taskc_prev, cpuc);
-
-			/*
-			 * Reset prev task's lock and futex boost count
-			 * for a lock holder to be boosted only once.
-			 */
-			if (is_lock_holder_running(cpuc))
-				reset_lock_futex_boost(taskc_prev, cpuc);
-
-			/*
-			 * Task flags can be updated when calculating the time
-			 * slice (LAVD_FLAG_SLICE_BOOST), so let's update the
-			 * CPU's copy of the flag as well.
-			 */
-			cpuc->flags = taskc_prev->flags;
-		}
-	}
+	consume_prev(prev, taskc_prev, cpuc);
 }
 
 void BPF_STRUCT_OPS(lavd_runnable, struct task_struct *p, u64 enq_flags)
@@ -1135,16 +1178,39 @@ void BPF_STRUCT_OPS(lavd_runnable, struct task_struct *p, u64 enq_flags)
 	 * Filter out unrelated tasks. We keep track of tasks under the same
 	 * parent process to confine the waker-wakee relationship within
 	 * closely related tasks.
+	 *
+	 * WARNING: bpf_in_nmi/task/hardirq/serving_softirq() is supported only
+	 * in x86 and arm64. On the unsupported architectures (e.g., s390x),
+	 * it will always return 0. So, never use !bpf_in_xxx() and keep the
+	 * logic below optional. See more details in below link:
+	 *  - https://lore.kernel.org/bpf/20260124132706.183681-2-changwoo@igalia.com/T/#u
 	 */
 	if (enq_flags & (SCX_ENQ_PREEMPT | SCX_ENQ_REENQ | SCX_ENQ_LAST))
 		return;
 
+	if (bpf_in_hardirq() || bpf_in_serving_softirq() || bpf_in_nmi())
+		return;
+
 	waker = bpf_get_current_task_btf();
+	if (is_ksoftirqd(waker))
+		return;
+
 	if ((p->real_parent != waker->real_parent))
 		return;
 
 	if (is_kernel_task(p) != is_kernel_task(waker))
 		return;
+
+	/*
+	 * If the waker is an RT or DL task, set the flag to increase the
+	 * wakee’s latency-criticality. We don’t track the latency-criticality
+	 * of RT/DL tasks, so we can not inherit their latency criticality.
+	 * Instead, we increase wakee’s latency-criticality by a fixed amount.
+	 */
+	if (rt_or_dl_task(waker))
+		set_task_flag(p_taskc, LAVD_FLAG_WOKEN_BY_RT_DL);
+	else
+		reset_task_flag(p_taskc, LAVD_FLAG_WOKEN_BY_RT_DL);
 
 	waker_taskc = get_task_ctx(waker);
 	if (!waker_taskc) {
@@ -1167,10 +1233,21 @@ void BPF_STRUCT_OPS(lavd_runnable, struct task_struct *p, u64 enq_flags)
 	}
 
 	/*
-	 * Propagate waker's latency criticality to wakee. Note that we pass
-	 * task's self latency criticality to limit the context into one hop.
+	 * Forward propagate waker’s latency criticality to wakee and
+	 * backward propagate wakee’s latency criticality to waker.
+	 *
+	 * Forward propagation is to keep the waker’s momentum forward to the
+	 * wakee, and backward propagation is to boost the low-priority waker
+	 * (i.e., priority inversion) for the next time. Propagation decays
+	 * geometrically and is capped to a limit to prevent unlimited cyclic
+	 * inflation of latency-criticality.
+	 *
+	 * Note that task @p’s latency criticality (p_taskc->lat_cri) is
+	 * not up-to-date, but such a small imprecision is okay.
 	 */
 	p_taskc->lat_cri_waker = waker_taskc->lat_cri;
+	if (waker_taskc->lat_cri_wakee < p_taskc->lat_cri)
+		waker_taskc->lat_cri_wakee = p_taskc->lat_cri;
 
 	/*
 	 * Collect additional information when the scheduler is monitored.
@@ -1399,7 +1476,7 @@ void BPF_STRUCT_OPS(lavd_cpu_online, s32 cpu)
 	cpu_ctx_init_online(cpuc, cpu, now);
 
 	__sync_fetch_and_add(&nr_cpus_onln, 1);
-	__sync_fetch_and_add(&total_capacity, cpuc->capacity);
+	__sync_fetch_and_add(&total_max_capacity, cpuc->max_capacity);
 	update_autopilot_high_cap();
 	update_sys_stat();
 }
@@ -1422,7 +1499,7 @@ void BPF_STRUCT_OPS(lavd_cpu_offline, s32 cpu)
 	cpu_ctx_init_offline(cpuc, cpu, now);
 
 	__sync_fetch_and_sub(&nr_cpus_onln, 1);
-	__sync_fetch_and_sub(&total_capacity, cpuc->capacity);
+	__sync_fetch_and_sub(&total_max_capacity, cpuc->max_capacity);
 	update_autopilot_high_cap();
 	update_sys_stat();
 }
@@ -1536,7 +1613,7 @@ void BPF_STRUCT_OPS(lavd_cpu_acquire, s32 cpu,
 	 * utilization.
 	 */
 	dur = time_delta(scx_bpf_now(), cpuc->cpu_release_clk);
-	scaled_dur = scale_cap_freq(dur, cpu);
+	scaled_dur = scale_cap_freq(dur, cpuc);
 	cpuc->tot_sc_time += scaled_dur;
 
 	/*
@@ -1604,9 +1681,10 @@ void BPF_STRUCT_OPS(lavd_enable, struct task_struct *p)
 s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init_task, struct task_struct *p,
 			     struct scx_init_task_args *args)
 {
-	task_ctx *taskc;
-	u64 now;
+	task_ctx *taskc, *taskc_parent;
+	struct task_struct *parent;
 	int i;
+	u64 now;
 
 	/*
 	 * When @p becomes under the SCX control (e.g., being forked), @p's
@@ -1628,38 +1706,58 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init_task, struct task_struct *p,
 		return -ENOMEM;
 	}
 
-
 	/*
 	 * Initialize @p's context.
+	 *
+	 * Inherit its parent properties, if possible, to maintain the same
+	 * latency and performance-criticality initially. Otherwise (i.e.,
+	 * its parent is an RT/DL task), set its properties to the average
+	 * fair task as a best guess.
+	 *
+	 * Note that this is a hack to bypass the restriction of the
+	 * current bpf not trusting the pointer p->real_parent.
+	 *
+	 * Note that we might need to consider the semantics of
+	 * SCHED_RESET_ON_FORK. At this point, it is unclear (may not?),
+	 * so let’s revisit this when it becomes necessary.
+	 * See the details here:
+	 *   https://man7.org/linux/man-pages/man2/sched_setscheduler.2.html
 	 */
-	for (i = 0; i < sizeof(*taskc) && can_loop; i++)
-		((char __arena *)taskc)[i] = 0;
+	parent = bpf_task_from_pid(p->real_parent->pid);
+	if (parent && (taskc_parent = get_task_ctx(parent))) {
+		for (i = 0; i < sizeof(*taskc) && can_loop; i++)
+			((char __arena *)taskc)[i] = ((char __arena *)taskc_parent)[i];
+	} else {
+		for (i = 0; i < sizeof(*taskc) && can_loop; i++)
+			((char __arena *)taskc)[i] = 0;
+	
+		now = scx_bpf_now();
+		taskc->last_runnable_clk = now;
+		taskc->last_running_clk = now; /* for avg_runtime */
+		taskc->last_stopping_clk = now; /* for avg_runtime */
+		taskc->last_quiescent_clk = now;
+		taskc->avg_runtime = sys_stat.slice;
+		taskc->svc_time = sys_stat.avg_svc_time;
+	}
+
+	taskc->pinned_cpu_id = -ENOENT;
+	taskc->pid = p->pid;
+	taskc->cgrp_id = args->cgroup->kn->id;
 
 	bpf_rcu_read_lock();
 	if (bpf_cpumask_weight(p->cpus_ptr) != nr_cpu_ids)
 		set_task_flag(taskc, LAVD_FLAG_IS_AFFINITIZED);
 	else
 		reset_task_flag(taskc, LAVD_FLAG_IS_AFFINITIZED);
+
+	set_on_core_type(taskc, p->cpus_ptr);
 	bpf_rcu_read_unlock();
 
 	if (is_ksoftirqd(p))
 		set_task_flag(taskc, LAVD_FLAG_KSOFTIRQD);
-	else
-		reset_task_flag(taskc, LAVD_FLAG_KSOFTIRQD);
 
-	now = scx_bpf_now();
-	taskc->last_runnable_clk = now;
-	taskc->last_running_clk = now; /* for avg_runtime */
-	taskc->last_stopping_clk = now; /* for avg_runtime */
-	taskc->last_quiescent_clk = now;
-	taskc->avg_runtime = sys_stat.slice;
-	taskc->svc_time = sys_stat.avg_svc_time;
-	taskc->pinned_cpu_id = -ENOENT;
-	taskc->pid = p->pid;
-	taskc->cgrp_id = args->cgroup->kn->id;
-
-	set_on_core_type(taskc, p->cpus_ptr);
-
+	if (parent)
+		bpf_task_release(parent);
 	return 0;
 }
 
@@ -1757,10 +1855,6 @@ static int init_cpumasks(void)
 	err = calloc_cpumask(&big_cpumask);
 	if (err)
 		goto out;
-
-	err = calloc_cpumask(&little_cpumask);
-	if (err)
-		goto out;
 out:
 	bpf_rcu_read_unlock();
 	return err;
@@ -1769,7 +1863,7 @@ out:
 static s32 init_per_cpu_ctx(u64 now)
 {
 	struct cpu_ctx *cpuc;
-	struct bpf_cpumask *turbo, *big, *little, *active, *ovrflw, *cd_cpumask;
+	struct bpf_cpumask *turbo, *big, *active, *ovrflw, *cd_cpumask;
 	const struct cpumask *online_cpumask;
 	struct cpdom_ctx *cpdomc;
 	int cpu, i, j, k, err = 0;
@@ -1784,10 +1878,9 @@ static s32 init_per_cpu_ctx(u64 now)
 	 */
 	turbo = turbo_cpumask;
 	big = big_cpumask;
-	little = little_cpumask;
 	active  = active_cpumask;
 	ovrflw  = ovrflw_cpumask;
-	if (!turbo || !big || !little || !active || !ovrflw) {
+	if (!turbo || !big || !active || !ovrflw) {
 		scx_bpf_error("Failed to prepare cpumasks.");
 		err = -ENOMEM;
 		goto unlock_out;
@@ -1796,7 +1889,7 @@ static s32 init_per_cpu_ctx(u64 now)
 	/*
 	 * Initialize CPU info
 	 */
-	one_little_capacity = LAVD_SCALE;
+	one_little_max_capacity = LAVD_SCALE;
 	bpf_for(cpu, 0, nr_cpu_ids) {
 		if (cpu >= LAVD_CPU_ID_MAX)
 			break;
@@ -1845,21 +1938,22 @@ static s32 init_per_cpu_ctx(u64 now)
 		cpuc->offline_clk = now;
 		cpuc->cpu_release_clk = now;
 		cpuc->is_online = bpf_cpumask_test_cpu(cpu, online_cpumask);
-		cpuc->capacity = cpu_capacity[cpu];
+		cpuc->max_capacity = cpu_capacity[cpu];
+		cpuc->effective_capacity = cpuc->max_capacity;
 		cpuc->big_core = cpu_big[cpu];
 		cpuc->turbo_core = cpu_turbo[cpu];
 		cpuc->min_perf_cri = LAVD_SCALE;
+		cpuc->max_freq = LAVD_SCALE;
 		cpuc->futex_op = LAVD_FUTEX_OP_INVALID;
 
-		sum_capacity += cpuc->capacity;
+		sum_capacity += cpuc->max_capacity;
 
 		if (cpuc->big_core) {
 			nr_cpus_big++;
-			big_capacity += cpuc->capacity;
+			big_capacity += cpuc->max_capacity;
 			bpf_cpumask_set_cpu(cpu, big);
 		}
 		else {
-			bpf_cpumask_set_cpu(cpu, little);
 			have_little_core = true;
 		}
 
@@ -1868,11 +1962,11 @@ static s32 init_per_cpu_ctx(u64 now)
 			have_turbo_core = true;
 		}
 
-		if (cpuc->capacity < one_little_capacity)
-			one_little_capacity = cpuc->capacity;
+		if (cpuc->max_capacity < one_little_max_capacity)
+			one_little_max_capacity = cpuc->max_capacity;
 	}
 	default_big_core_scale = (big_capacity << LAVD_SHIFT) / sum_capacity;
-	total_capacity = sum_capacity;
+	total_max_capacity = sum_capacity;
 
 	/*
 	 * Initialize compute domain id.
@@ -1911,7 +2005,7 @@ static s32 init_per_cpu_ctx(u64 now)
 				if (bpf_cpumask_test_cpu(cpu, online_cpumask)) {
 					bpf_cpumask_set_cpu(cpu, cd_cpumask);
 					cpdomc->nr_active_cpus++;
-					cpdomc->cap_sum_active_cpus += cpuc->capacity;
+					cpdomc->cap_sum_active_cpus += cpuc->effective_capacity;
 				}
 			}
 		}
@@ -1927,9 +2021,9 @@ static s32 init_per_cpu_ctx(u64 now)
 			err = -ESRCH;
 			goto unlock_out;
 		}
-		debugln("cpu[%d] capacity: %d, big_core: %d, turbo_core: %d, "
+		debugln("cpu[%d] max_capacity: %d, big_core: %d, turbo_core: %d, "
 			"cpdom_id: %llu, alt_id: %llu",
-			cpu, cpuc->capacity, cpuc->big_core, cpuc->turbo_core,
+			cpu, cpuc->max_capacity, cpuc->big_core, cpuc->turbo_core,
 			cpuc->cpdom_id, cpuc->cpdom_alt_id);
 	}
 
@@ -2127,6 +2221,54 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init)
 void BPF_STRUCT_OPS(lavd_exit, struct scx_exit_info *ei)
 {
 	UEI_RECORD(uei, ei);
+}
+
+static
+int set_aggressive_migration(void)
+{
+	struct task_struct *curr;
+	struct cpdom_ctx *cpdc;
+	struct cpu_ctx *cpuc;
+	task_ctx *taskc;
+	u32 cpu;
+
+	/*
+	 * When a task is about to call execv() and the current CPU is
+	 * overloaded (is_stealee), set the LAVD_FLAG_MIGRATION_AGGRESSIVE
+	 * flag and preempt itself to trigger aggressive migration right
+	 * now.
+	 *
+	 * Self-preemption is not cheap because it issues a self-IPI.
+	 * We assume calling execve() is rare and we send an IPI only when
+	 * the domain is overloaded, so it should be okay.
+	 */
+	if (nr_cpdoms == 1)
+		return 0;
+
+	cpu = bpf_get_smp_processor_id();
+	if ((curr = bpf_get_current_task_btf()) &&
+	    (taskc = get_task_ctx(curr)) &&
+	    (cpuc = get_cpu_ctx_id(cpu)) &&
+	    (cpdc = MEMBER_VPTR(cpdom_ctxs, [cpuc->cpdom_id])) &&
+	    READ_ONCE(cpdc->is_stealee)) {
+		set_task_flag(taskc, LAVD_FLAG_MIGRATION_AGGRESSIVE);
+		scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
+	}
+	return 0;
+}
+
+SEC("?tracepoint/syscalls/sys_enter_execve")
+int BPF_PROG(cond_hook_sys_enter_execve)
+{
+	set_aggressive_migration();
+	return 0;
+}
+
+SEC("?tracepoint/syscalls/sys_enter_execveat")
+int BPF_PROG(cond_hook_sys_enter_execveat)
+{
+	set_aggressive_migration();
+	return 0;
 }
 
 SCX_OPS_DEFINE(lavd_ops,
