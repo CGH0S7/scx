@@ -355,6 +355,10 @@ s32 BPF_STRUCT_OPS(hpc_select_cpu, struct task_struct *p,
  *
  * HPC tasks: direct local dispatch with infinite slice.
  * SERVICE tasks: vruntime-based fair scheduling on SERVICE_DSQ.
+ *
+ * Special case: migration-disabled SERVICE tasks (e.g., per-CPU kworkers)
+ * pinned to a compute core are dispatched locally so they don't starve
+ * in SERVICE_DSQ which compute cores never consume.
  */
 void BPF_STRUCT_OPS(hpc_enqueue, struct task_struct *p, u64 enq_flags)
 {
@@ -368,6 +372,19 @@ void BPF_STRUCT_OPS(hpc_enqueue, struct task_struct *p, u64 enq_flags)
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_INF,
 				    enq_flags);
 		__sync_fetch_and_add(&nr_hpc_dispatches, 1);
+		return;
+	}
+
+	/*
+	 * SERVICE task pinned to a compute core (migration disabled):
+	 * dispatch locally with a bounded slice so it can run on that
+	 * compute CPU without starving in SERVICE_DSQ.
+	 */
+	if ((enq_flags & SCX_ENQ_MIGRATION_DISABLED) &&
+	    is_compute_cpu(scx_bpf_task_cpu(p))) {
+		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, service_slice_ns,
+				    enq_flags);
+		__sync_fetch_and_add(&nr_service_dispatches, 1);
 		return;
 	}
 
