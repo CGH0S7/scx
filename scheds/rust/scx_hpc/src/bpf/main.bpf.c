@@ -376,17 +376,27 @@ void BPF_STRUCT_OPS(hpc_enqueue, struct task_struct *p, u64 enq_flags)
 	}
 
 	/*
-	 * SERVICE task pinned to a compute core: dispatch locally with
-	 * a bounded slice so it doesn't starve in SERVICE_DSQ which
-	 * compute cores normally don't consume. This covers per-CPU
-	 * kworkers bound via cpumask or migration-disabled flag.
+	 * SERVICE task that cannot run on any service core: dispatch
+	 * locally on its current compute core with a bounded slice.
+	 * This covers per-CPU kworkers and tasks whose cpumask has
+	 * no overlap with the service cpumask (e.g., mpiexec.hydra).
 	 */
-	if (is_compute_cpu(scx_bpf_task_cpu(p)) &&
-	    p->nr_cpus_allowed == 1) {
-		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, service_slice_ns,
-				    enq_flags);
-		__sync_fetch_and_add(&nr_service_dispatches, 1);
-		return;
+	if (is_compute_cpu(scx_bpf_task_cpu(p))) {
+		bool can_use_service = false;
+
+		bpf_rcu_read_lock();
+		if (service_cpumask) {
+			can_use_service = bpf_cpumask_intersects(
+				p->cpus_ptr, cast_mask(service_cpumask));
+		}
+		bpf_rcu_read_unlock();
+
+		if (!can_use_service) {
+			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL,
+					    service_slice_ns, enq_flags);
+			__sync_fetch_and_add(&nr_service_dispatches, 1);
+			return;
+		}
 	}
 
 	/*
