@@ -376,12 +376,13 @@ void BPF_STRUCT_OPS(hpc_enqueue, struct task_struct *p, u64 enq_flags)
 	}
 
 	/*
-	 * SERVICE task pinned to a compute core (migration disabled):
-	 * dispatch locally with a bounded slice so it can run on that
-	 * compute CPU without starving in SERVICE_DSQ.
+	 * SERVICE task pinned to a compute core: dispatch locally with
+	 * a bounded slice so it doesn't starve in SERVICE_DSQ which
+	 * compute cores normally don't consume. This covers per-CPU
+	 * kworkers bound via cpumask or migration-disabled flag.
 	 */
-	if ((enq_flags & SCX_OPS_ENQ_MIGRATION_DISABLED) &&
-	    is_compute_cpu(scx_bpf_task_cpu(p))) {
+	if (is_compute_cpu(scx_bpf_task_cpu(p)) &&
+	    p->nr_cpus_allowed == 1) {
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, service_slice_ns,
 				    enq_flags);
 		__sync_fetch_and_add(&nr_service_dispatches, 1);
@@ -399,7 +400,8 @@ void BPF_STRUCT_OPS(hpc_enqueue, struct task_struct *p, u64 enq_flags)
 /*
  * dispatch: CPU dispatch.
  *
- * Compute cores: never consume SERVICE_DSQ. Keep HPC task running.
+ * Compute cores: keep HPC task running; also consume SERVICE_DSQ as
+ *                fallback for pinned kworkers that can only run here.
  * Service cores: consume from SERVICE_DSQ.
  */
 void BPF_STRUCT_OPS(hpc_dispatch, s32 cpu, struct task_struct *prev)
@@ -424,9 +426,11 @@ void BPF_STRUCT_OPS(hpc_dispatch, s32 cpu, struct task_struct *prev)
 			}
 		}
 		/*
-		 * Compute core idle or prev is not HPC.
-		 * Do NOT consume from SERVICE_DSQ - let it stay idle.
+		 * Compute core idle or prev is not HPC: try to pick up
+		 * pinned SERVICE tasks (e.g., per-CPU kworkers) from
+		 * SERVICE_DSQ so they don't starve.
 		 */
+		scx_bpf_dsq_move_to_local(SERVICE_DSQ);
 		return;
 	}
 
