@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 //
-// Copyright (c) 2025 Andrea Righi <arighi@nvidia.com>
+// Copyright (c) 2025 CGH0S7 <jasoncheng@hifuu.ink>
 
-// This software may be used and distributed according to the terms of the
-// GNU General Public License version 2.
 #![allow(non_upper_case_globals)]
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
