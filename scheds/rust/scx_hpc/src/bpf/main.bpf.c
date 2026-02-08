@@ -510,10 +510,28 @@ void BPF_STRUCT_OPS(hpc_stopping, struct task_struct *p, bool runnable)
 
 /*
  * tick: periodic tick on a CPU.
+ *
+ * On compute cores, if the current HPC task holds SCX_SLICE_INF but
+ * there are pinned kworkers queued in the local DSQ, give the HPC
+ * task a finite slice so dispatch() runs and the kworker gets a
+ * chance to execute briefly.
  */
 void BPF_STRUCT_OPS(hpc_tick, struct task_struct *p)
 {
+	s32 cpu = bpf_get_smp_processor_id();
+	struct cpu_ctx *cctx;
+
 	__sync_fetch_and_add(&nr_ticks, 1);
+
+	cctx = try_lookup_cpu_ctx(cpu);
+	if (!cctx || !cctx->is_compute)
+		return;
+
+	if (p->scx.slice == SCX_SLICE_INF &&
+	    scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpu) > 0) {
+		p->scx.slice = service_slice_ns;
+		__sync_fetch_and_add(&nr_hpc_preemptions, 1);
+	}
 }
 
 /*

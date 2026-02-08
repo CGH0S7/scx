@@ -1,6 +1,6 @@
 [package]
 name = "scx_hpc"
-version = "1.0.2"
+version = "1.0.3"
 authors = ["CGH0S7 <jasoncheng@hifuu.ink>"]
 edition = "2021"
 description = "An HPC-dedicated scheduler for MPI/OpenMP scientific computing workloads, minimizing OS noise on compute cores. https://github.com/sched-ext/scx/tree/main"
