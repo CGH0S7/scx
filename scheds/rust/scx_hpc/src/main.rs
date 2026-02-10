@@ -76,6 +76,11 @@ struct Opts {
     #[clap(long)]
     hpc_comm: Option<String>,
 
+    /// Like --hpc-comm, but one-shot: wait up to 30s for a matching process,
+    /// attach the scheduler, then auto-exit when all matching processes are gone.
+    #[clap(long, conflicts_with = "hpc_comm")]
+    hpc_comm_once: Option<String>,
+
     /// Maximum scheduling slice for service tasks in microseconds.
     #[clap(short = 's', long, default_value = "20000")]
     slice_us: u64,
@@ -165,7 +170,7 @@ impl<'a> Scheduler<'a> {
         rodata.tick_freq = opts.frequency;
 
         // Configure comm-based detection.
-        if let Some(ref comm_list) = opts.hpc_comm {
+        if let Some(ref comm_list) = opts.hpc_comm.as_ref().or(opts.hpc_comm_once.as_ref()) {
             let prefixes: Vec<&str> = comm_list.split(',').collect();
             rodata.detect_by_comm = true;
             rodata.nr_comm_prefixes = prefixes.len().min(
@@ -209,7 +214,7 @@ impl<'a> Scheduler<'a> {
         }
 
         // Populate comm prefixes if provided.
-        if let Some(ref comm_list) = opts.hpc_comm {
+        if let Some(ref comm_list) = opts.hpc_comm.as_ref().or(opts.hpc_comm_once.as_ref()) {
             Self::populate_comm_prefixes(&mut skel, comm_list)?;
         }
 
@@ -542,13 +547,28 @@ impl<'a> Scheduler<'a> {
         uei_exited!(&self.skel, uei)
     }
 
-    fn run(&mut self, shutdown: Arc<AtomicBool>) -> Result<UserExitInfo> {
+    fn run(
+        &mut self,
+        shutdown: Arc<AtomicBool>,
+        comm_once_prefixes: Option<Vec<&str>>,
+    ) -> Result<UserExitInfo> {
         let (res_ch, req_ch) = self.stats_server.channels();
+        let mut poll_counter: u32 = 0;
         while !shutdown.load(Ordering::Relaxed) && !self.exited() {
             match req_ch.recv_timeout(Duration::from_secs(1)) {
                 Ok(()) => res_ch.send(self.get_metrics())?,
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(e) => Err(e)?,
+            }
+
+            if let Some(ref prefixes) = comm_once_prefixes {
+                poll_counter += 1;
+                if poll_counter % 3 == 0 {
+                    if !scan_proc_for_comm_prefixes(prefixes) {
+                        info!("all matching processes have exited, shutting down");
+                        break;
+                    }
+                }
             }
         }
 
@@ -561,6 +581,33 @@ impl Drop for Scheduler<'_> {
     fn drop(&mut self) {
         info!("Unregister {} scheduler", SCHEDULER_NAME);
     }
+}
+
+fn scan_proc_for_comm_prefixes(prefixes: &[&str]) -> bool {
+    let proc_dir = match std::fs::read_dir("/proc") {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+
+    for entry in proc_dir.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if !name_str.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+
+        let comm_path = entry.path().join("comm");
+        if let Ok(comm) = std::fs::read_to_string(&comm_path) {
+            let comm = comm.trim();
+            for prefix in prefixes {
+                if comm.starts_with(prefix) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
 }
 
 fn main() -> Result<()> {
@@ -624,11 +671,43 @@ fn main() -> Result<()> {
         }
     }
 
-    let mut open_object = MaybeUninit::uninit();
-    loop {
+    if let Some(ref comm_once_list) = opts.hpc_comm_once {
+        let prefixes: Vec<&str> = comm_once_list.split(',').map(|s| s.trim()).collect();
+
+        // Wait up to 30s for a matching process to appear.
+        info!(
+            "waiting for processes matching comm prefixes: {:?}",
+            prefixes
+        );
+        let mut found = false;
+        for _ in 0..30 {
+            if shutdown.load(Ordering::Relaxed) {
+                info!("interrupted during wait phase");
+                return Ok(());
+            }
+            if scan_proc_for_comm_prefixes(&prefixes) {
+                found = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+
+        if !found {
+            info!("no matching processes found after 30s, exiting");
+            return Ok(());
+        }
+
+        info!("matching process found, attaching scheduler");
+        let mut open_object = MaybeUninit::uninit();
         let mut sched = Scheduler::init(&opts, &mut open_object)?;
-        if !sched.run(shutdown.clone())?.should_restart() {
-            break;
+        sched.run(shutdown.clone(), Some(prefixes))?;
+    } else {
+        let mut open_object = MaybeUninit::uninit();
+        loop {
+            let mut sched = Scheduler::init(&opts, &mut open_object)?;
+            if !sched.run(shutdown.clone(), None)?.should_restart() {
+                break;
+            }
         }
     }
 
