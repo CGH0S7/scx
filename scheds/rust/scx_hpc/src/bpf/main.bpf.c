@@ -267,7 +267,8 @@ s32 BPF_STRUCT_OPS(hpc_select_cpu, struct task_struct *p,
 		/*
 		 * HPC: prefer prev_cpu for cache locality.
 		 */
-		if (is_compute_cpu(prev_cpu)) {
+		if (is_compute_cpu(prev_cpu) &&
+		    bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr)) {
 			scx_bpf_test_and_clear_cpu_idle(prev_cpu);
 			return prev_cpu;
 		}
@@ -320,8 +321,21 @@ s32 BPF_STRUCT_OPS(hpc_select_cpu, struct task_struct *p,
 				__sync_fetch_and_add(&nr_numa_remote, 1);
 				return cpu;
 			}
+			cpu = bpf_cpumask_any_and_distribute(mask, p->cpus_ptr);
+			if (cpu < nr_cpu_ids) {
+				bpf_rcu_read_unlock();
+				__sync_fetch_and_add(&nr_numa_remote, 1);
+				return cpu;
+			}
 		}
 		bpf_rcu_read_unlock();
+
+		if (bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr))
+			return prev_cpu;
+
+		cpu = bpf_cpumask_any_distribute(p->cpus_ptr);
+		if (cpu < nr_cpu_ids)
+			return cpu;
 
 		return prev_cpu;
 	}
@@ -337,7 +351,7 @@ s32 BPF_STRUCT_OPS(hpc_select_cpu, struct task_struct *p,
 			bpf_rcu_read_unlock();
 			return cpu;
 		}
-		cpu = bpf_cpumask_any_distribute(mask);
+		cpu = bpf_cpumask_any_and_distribute(mask, p->cpus_ptr);
 		bpf_rcu_read_unlock();
 		if (cpu < nr_cpu_ids) {
 			scx_bpf_test_and_clear_cpu_idle(cpu);
@@ -346,6 +360,13 @@ s32 BPF_STRUCT_OPS(hpc_select_cpu, struct task_struct *p,
 	} else {
 		bpf_rcu_read_unlock();
 	}
+
+	if (bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr))
+		return prev_cpu;
+
+	cpu = bpf_cpumask_any_distribute(p->cpus_ptr);
+	if (cpu < nr_cpu_ids)
+		return cpu;
 
 	return prev_cpu;
 }

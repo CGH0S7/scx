@@ -63,8 +63,7 @@ impl Metrics {
             nr_service_dispatches: self.nr_service_dispatches - rhs.nr_service_dispatches,
             nr_hpc_preemptions: self.nr_hpc_preemptions - rhs.nr_hpc_preemptions,
             nr_service_preemptions: self.nr_service_preemptions - rhs.nr_service_preemptions,
-            nr_migrations_to_service: self.nr_migrations_to_service
-                - rhs.nr_migrations_to_service,
+            nr_migrations_to_service: self.nr_migrations_to_service - rhs.nr_migrations_to_service,
             nr_ticks: self.nr_ticks - rhs.nr_ticks,
             nr_numa_local: self.nr_numa_local - rhs.nr_numa_local,
             nr_numa_remote: self.nr_numa_remote - rhs.nr_numa_remote,
@@ -77,14 +76,13 @@ pub fn server_data() -> StatsServerData<(), Metrics> {
         req_ch.send(())?;
         let mut prev = res_ch.recv()?;
 
-        let read: Box<dyn StatsReader<(), Metrics>> =
-            Box::new(move |_args, (req_ch, res_ch)| {
-                req_ch.send(())?;
-                let cur = res_ch.recv()?;
-                let delta = cur.delta(&prev);
-                prev = cur;
-                delta.to_json()
-            });
+        let read: Box<dyn StatsReader<(), Metrics>> = Box::new(move |_args, (req_ch, res_ch)| {
+            req_ch.send(())?;
+            let cur = res_ch.recv()?;
+            let delta = cur.delta(&prev);
+            prev = cur;
+            delta.to_json()
+        });
 
         Ok(read)
     });

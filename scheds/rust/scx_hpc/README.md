@@ -78,7 +78,7 @@ A BPF timer runs **only on service cores**. It periodically checks for contentio
 
 ### Basic (Auto Mode)
 
-By default, `scx_hpc` uses the lowest-capacity CPU as the service core and all remaining CPUs as compute cores:
+By default, `scx_hpc` uses `--auto-mode smart`, which reserves a small number of low-capacity full physical cores for service work and keeps the remaining cores for compute work:
 
 ```bash
 sudo scx_hpc --hpc-comm "mpirun,lammps,vasp,gromacs"
@@ -128,8 +128,9 @@ sudo kill %1
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--compute-cpus <HEX>` | `0` (auto) | Hex bitmask of compute cores. `0` = all except lowest-capacity CPU. |
-| `--service-cpus <HEX>` | `0` (auto) | Hex bitmask of service cores. `0` = lowest-capacity CPU. |
+| `--compute-cpus <HEX>` | `0` (auto) | Hex bitmask of compute cores. `0` = auto-select based on `--auto-mode`. |
+| `--service-cpus <HEX>` | `0` (auto) | Hex bitmask of service cores. `0` = auto-select based on `--auto-mode`. |
+| `--auto-mode <smart\|legacy>` | `smart` | Auto partition strategy when CPU masks are not specified. `smart` reserves whole physical cores and spreads service capacity across NUMA nodes; `legacy` keeps the old single lowest-capacity CPU behavior. |
 | `--hpc-pids <LIST>` | none | Comma-separated PIDs/tgids to classify as HPC. |
 | `--hpc-comm <LIST>` | none | Comma-separated comm name prefixes for HPC detection. |
 | `-s, --slice-us <US>` | `20000` | Time slice for service tasks (microseconds). |
@@ -164,6 +165,7 @@ If `nr_hpc_preemptions` is consistently 0, the scheduler is working as intended 
 ## Safety Mechanisms
 
 - **Minimum one service core**: If the user specifies all CPUs as compute, CPU 0 is forced to be a service core.
+- **No overlapping partitions**: User-provided compute and service CPU masks must be disjoint.
 - **Kernel threads always SERVICE**: `PF_KTHREAD` tasks are never classified as HPC, preventing kernel thread starvation.
 - **BPF timeout**: `timeout_ms = 10000` — if the scheduler stalls for 10 seconds, the kernel automatically falls back to the default scheduler.
 - **Clean shutdown**: Ctrl-C cleanly detaches the BPF scheduler, returning the system to EEVDF.
@@ -173,6 +175,7 @@ If `nr_hpc_preemptions` is consistently 0, the scheduler is working as intended 
 
 - **NUMA nodes**: Up to 4 NUMA nodes are supported for per-NUMA compute cpumask tracking (BPF verifier constraint). Systems with more NUMA nodes will still work but without per-node placement optimization for nodes 4+.
 - **Dynamic reclassification**: Tasks are classified at creation time. If a process is launched before `scx_hpc` and its tgid is not in `--hpc-pids`, it will be classified as SERVICE. Restarting the process or using `--hpc-comm` for name-based matching works around this.
+- **Pinned task exceptions**: Migration-disabled or affinity-constrained SERVICE tasks may still execute on compute cores when there is no legal service CPU for them.
 - **Hot-load only**: This scheduler is designed for temporary use during HPC runs. It intentionally sacrifices fairness for throughput and should not be used as a general-purpose scheduler.
 
 ## Building

@@ -26,6 +26,7 @@ use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
 use clap::Parser;
+use clap::ValueEnum;
 use crossbeam::channel::RecvTimeoutError;
 use libbpf_rs::MapCore;
 use libbpf_rs::OpenObject;
@@ -49,6 +50,12 @@ use stats::Metrics;
 
 const SCHEDULER_NAME: &str = "scx_hpc";
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum AutoMode {
+    Legacy,
+    Smart,
+}
+
 #[derive(Debug, Parser)]
 #[command(about = "HPC-dedicated scheduler for MPI/OpenMP scientific computing")]
 struct Opts {
@@ -57,15 +64,19 @@ struct Opts {
     exit_dump_len: u32,
 
     /// Hex bitmask of CPUs to use as compute cores.
-    /// "auto" = all CPUs except the lowest-capacity one.
-    /// "0" or empty = auto mode.
+    /// "0" or empty = automatic partitioning.
     #[clap(long, default_value = "0")]
     compute_cpus: String,
 
     /// Hex bitmask of CPUs to use as service cores.
-    /// "auto" or "0" = auto-detect (lowest-capacity CPU).
+    /// "0" or empty = automatic partitioning.
     #[clap(long, default_value = "0")]
     service_cpus: String,
+
+    /// Automatic CPU partitioning strategy when compute/service masks are not
+    /// specified explicitly.
+    #[clap(long, value_enum, default_value = "smart")]
+    auto_mode: AutoMode,
 
     /// Comma-separated list of PIDs (tgids) to classify as HPC workloads.
     #[clap(long)]
@@ -139,8 +150,7 @@ impl<'a> Scheduler<'a> {
         );
 
         // Determine compute and service CPU sets.
-        let (compute_mask, service_mask) =
-            Self::determine_cpu_partitions(opts, &topo)?;
+        let (compute_mask, service_mask) = Self::determine_cpu_partitions(opts, &topo)?;
 
         info!("compute CPUs: 0x{:x}", compute_mask);
         info!("service CPUs: 0x{:x}", service_mask);
@@ -173,9 +183,10 @@ impl<'a> Scheduler<'a> {
         if let Some(ref comm_list) = opts.hpc_comm.as_ref().or(opts.hpc_comm_once.as_ref()) {
             let prefixes: Vec<&str> = comm_list.split(',').collect();
             rodata.detect_by_comm = true;
-            rodata.nr_comm_prefixes = prefixes.len().min(
-                bpf_intf::hpc_consts_MAX_COMM_PREFIXES as usize,
-            ) as u32;
+            rodata.nr_comm_prefixes = prefixes
+                .len()
+                .min(bpf_intf::hpc_consts_MAX_COMM_PREFIXES as usize)
+                as u32;
         }
 
         // Set scheduler flags.
@@ -236,15 +247,8 @@ impl<'a> Scheduler<'a> {
         })
     }
 
-    fn determine_cpu_partitions(
-        opts: &Opts,
-        topo: &Topology,
-    ) -> Result<(Cpumask, Cpumask)> {
+    fn determine_cpu_partitions(opts: &Opts, topo: &Topology) -> Result<(Cpumask, Cpumask)> {
         let nr_cpus = *NR_CPU_IDS;
-
-        // Sort CPUs by capacity (descending).
-        let mut cpus: Vec<_> = topo.all_cpus.values().collect();
-        cpus.sort_by_key(|cpu| std::cmp::Reverse(cpu.cpu_capacity));
 
         let compute_input = opts.compute_cpus.trim();
         let service_input = opts.service_cpus.trim();
@@ -253,19 +257,7 @@ impl<'a> Scheduler<'a> {
         let mut service_mask;
 
         if compute_input == "0" && service_input == "0" {
-            // Auto mode: service = lowest-capacity CPU, compute = rest.
-            service_mask = Cpumask::new();
-            compute_mask = Cpumask::new();
-
-            if let Some(slowest) = cpus.last() {
-                service_mask.set_cpu(slowest.id)?;
-            }
-
-            for cpu_info in &cpus {
-                if !service_mask.test_cpu(cpu_info.id) {
-                    compute_mask.set_cpu(cpu_info.id)?;
-                }
-            }
+            (compute_mask, service_mask) = Self::determine_auto_cpu_partitions(opts, topo)?;
         } else {
             // Manual mode.
             if compute_input != "0" {
@@ -299,6 +291,8 @@ impl<'a> Scheduler<'a> {
             }
         }
 
+        Self::validate_cpu_partitions(&compute_mask, &service_mask)?;
+
         // Safety: ensure at least one service core.
         if service_mask.is_empty() {
             warn!("no service cores specified, forcing CPU 0 as service");
@@ -319,11 +313,126 @@ impl<'a> Scheduler<'a> {
         Ok((compute_mask, service_mask))
     }
 
-    fn call_cpu_syscall(
-        skel: &mut BpfSkel<'_>,
-        prog_name: &str,
-        cpu_id: i32,
-    ) -> Result<(), u32> {
+    fn determine_auto_cpu_partitions(opts: &Opts, topo: &Topology) -> Result<(Cpumask, Cpumask)> {
+        match opts.auto_mode {
+            AutoMode::Legacy => {
+                let mut cpus_by_capacity: Vec<_> = topo.all_cpus.values().collect();
+                cpus_by_capacity.sort_by_key(|cpu| std::cmp::Reverse(cpu.cpu_capacity));
+                let mut service_mask = Cpumask::new();
+                let mut compute_mask = Cpumask::new();
+
+                if let Some(slowest) = cpus_by_capacity.last() {
+                    service_mask.set_cpu(slowest.id)?;
+                }
+
+                for cpu_info in cpus_by_capacity {
+                    if !service_mask.test_cpu(cpu_info.id) {
+                        compute_mask.set_cpu(cpu_info.id)?;
+                    }
+                }
+
+                info!("auto mode: legacy");
+                Ok((compute_mask, service_mask))
+            }
+            AutoMode::Smart => Self::determine_smart_auto_cpu_partitions(topo),
+        }
+    }
+
+    fn determine_smart_auto_cpu_partitions(topo: &Topology) -> Result<(Cpumask, Cpumask)> {
+        #[derive(Clone)]
+        struct CoreChoice {
+            cpus: Vec<usize>,
+            node_id: usize,
+            llc_id: usize,
+            core_id: usize,
+            capacity: usize,
+        }
+
+        let mut cores = Vec::new();
+        for core in topo.all_cores.values() {
+            let mut cpu_ids: Vec<usize> = core.cpus.keys().copied().collect();
+            cpu_ids.sort_unstable();
+            let capacity = core
+                .cpus
+                .values()
+                .map(|cpu| cpu.cpu_capacity)
+                .min()
+                .unwrap_or(0);
+
+            cores.push(CoreChoice {
+                cpus: cpu_ids,
+                node_id: core.node_id,
+                llc_id: core.llc_id,
+                core_id: core.id,
+                capacity,
+            });
+        }
+
+        if cores.is_empty() {
+            bail!("topology did not report any CPU cores");
+        }
+
+        cores.sort_by_key(|core| (core.capacity, core.node_id, core.llc_id, core.core_id));
+
+        let total_cores = cores.len();
+        let min_service_cores = topo.nodes.len().max(1);
+        let proportional_service_cores = total_cores.div_ceil(16).max(1);
+        let target_service_cores = min_service_cores
+            .max(proportional_service_cores)
+            .min(total_cores.saturating_sub(1).max(1));
+
+        let mut chosen = std::collections::BTreeSet::new();
+
+        // Reserve at least one full physical core per NUMA node when possible.
+        for node_id in topo.nodes.keys() {
+            if let Some((idx, _)) = cores
+                .iter()
+                .enumerate()
+                .find(|(idx, core)| core.node_id == *node_id && !chosen.contains(idx))
+            {
+                chosen.insert(idx);
+            }
+        }
+
+        for idx in 0..cores.len() {
+            if chosen.len() >= target_service_cores {
+                break;
+            }
+            chosen.insert(idx);
+        }
+
+        let mut service_mask = Cpumask::new();
+        let mut compute_mask = Cpumask::new();
+
+        for (idx, core) in cores.iter().enumerate() {
+            let target = if chosen.contains(&idx) {
+                &mut service_mask
+            } else {
+                &mut compute_mask
+            };
+
+            for cpu_id in &core.cpus {
+                target.set_cpu(*cpu_id)?;
+            }
+        }
+
+        info!(
+            "auto mode: smart (reserved {} service cores across {} NUMA node(s))",
+            chosen.len(),
+            topo.nodes.len()
+        );
+        Ok((compute_mask, service_mask))
+    }
+
+    fn validate_cpu_partitions(compute_mask: &Cpumask, service_mask: &Cpumask) -> Result<()> {
+        let overlap = compute_mask.and(service_mask);
+        if !overlap.is_empty() {
+            bail!("compute_cpus and service_cpus overlap: 0x{:x}", overlap);
+        }
+        Ok(())
+    }
+
+    fn call_cpu_syscall(skel: &mut BpfSkel<'_>, prog_name: &str, cpu_id: i32) -> Result<(), u32> {
         let prog = match prog_name {
             "enable_compute_cpu" => &mut skel.progs.enable_compute_cpu,
             "enable_service_cpu" => &mut skel.progs.enable_service_cpu,
@@ -350,11 +459,7 @@ impl<'a> Scheduler<'a> {
         Ok(())
     }
 
-    fn call_tgid_syscall(
-        skel: &mut BpfSkel<'_>,
-        prog_name: &str,
-        tgid: i32,
-    ) -> Result<(), u32> {
+    fn call_tgid_syscall(skel: &mut BpfSkel<'_>, prog_name: &str, tgid: i32) -> Result<(), u32> {
         let prog = match prog_name {
             "register_hpc_tgid" => &mut skel.progs.register_hpc_tgid,
             "unregister_hpc_tgid" => &mut skel.progs.unregister_hpc_tgid,
@@ -378,11 +483,7 @@ impl<'a> Scheduler<'a> {
         Ok(())
     }
 
-    fn init_cpu_mask(
-        skel: &mut BpfSkel<'_>,
-        mask: &Cpumask,
-        is_compute: bool,
-    ) -> Result<()> {
+    fn init_cpu_mask(skel: &mut BpfSkel<'_>, mask: &Cpumask, is_compute: bool) -> Result<()> {
         let prog_name = if is_compute {
             "enable_compute_cpu"
         } else {
@@ -419,23 +520,14 @@ impl<'a> Scheduler<'a> {
 
             // Only support up to 4 NUMA nodes in BPF.
             if node_idx >= 4 {
-                warn!(
-                    "NUMA node {} exceeds BPF limit of 4, skipping",
-                    node_idx
-                );
+                warn!("NUMA node {} exceeds BPF limit of 4, skipping", node_idx);
                 continue;
             }
 
             // Clear the NUMA mask first.
-            if let Err(err) = Self::call_cpu_syscall(
-                skel,
-                "set_numa_compute_cpu",
-                -(node_idx + 1),
-            ) {
-                warn!(
-                    "failed to clear NUMA {} mask: error {}",
-                    node_idx, err
-                );
+            if let Err(err) = Self::call_cpu_syscall(skel, "set_numa_compute_cpu", -(node_idx + 1))
+            {
+                warn!("failed to clear NUMA {} mask: error {}", node_idx, err);
             }
 
             // Set compute CPUs in this NUMA node.
@@ -443,11 +535,8 @@ impl<'a> Scheduler<'a> {
                 if compute_mask.test_cpu(cpu_id) {
                     // Encode: node in upper 16 bits, cpu in lower 16 bits.
                     let encoded = (node_idx << 16) | (cpu_id as i32);
-                    if let Err(err) = Self::call_cpu_syscall(
-                        skel,
-                        "set_numa_compute_cpu",
-                        encoded,
-                    ) {
+                    if let Err(err) = Self::call_cpu_syscall(skel, "set_numa_compute_cpu", encoded)
+                    {
                         warn!(
                             "failed to add CPU {} to NUMA {} mask: error {}",
                             cpu_id, node_idx, err
@@ -461,10 +550,7 @@ impl<'a> Scheduler<'a> {
                 .iter()
                 .filter(|&cpu| compute_mask.test_cpu(cpu))
                 .count();
-            info!(
-                "NUMA node {}: {} compute CPUs",
-                node_idx, count
-            );
+            info!("NUMA node {}: {} compute CPUs", node_idx, count);
         }
 
         Ok(())
@@ -478,9 +564,7 @@ impl<'a> Scheduler<'a> {
             }
             match pid_str.parse::<i32>() {
                 Ok(pid) => {
-                    if let Err(err) =
-                        Self::call_tgid_syscall(skel, "register_hpc_tgid", pid)
-                    {
+                    if let Err(err) = Self::call_tgid_syscall(skel, "register_hpc_tgid", pid) {
                         warn!("failed to register HPC tgid {}: error {}", pid, err);
                     } else {
                         info!("registered HPC tgid: {}", pid);
