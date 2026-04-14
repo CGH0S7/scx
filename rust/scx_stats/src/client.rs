@@ -131,3 +131,9 @@ impl StatsClient {
         self.send_request(&StatsRequest::new(req, args))
     }
 }
+
+impl Default for StatsClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}

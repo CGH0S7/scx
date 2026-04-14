@@ -43,6 +43,12 @@ pub unsafe fn perf_event_open(
 }
 
 pub mod bindings {
+    #![allow(clippy::missing_safety_doc)]
+    #![allow(clippy::ptr_offset_with_cast)]
+    #![allow(clippy::too_many_arguments)]
+    #![allow(clippy::unnecessary_cast)]
+    #![allow(clippy::useless_transmute)]
+
     include!(concat!(env!("OUT_DIR"), "/perf_bindings.rs"));
 }
 

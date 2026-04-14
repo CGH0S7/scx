@@ -180,7 +180,7 @@ impl<'a> Scheduler<'a> {
         rodata.tick_freq = opts.frequency;
 
         // Configure comm-based detection.
-        if let Some(ref comm_list) = opts.hpc_comm.as_ref().or(opts.hpc_comm_once.as_ref()) {
+        if let Some(comm_list) = opts.hpc_comm.as_ref().or(opts.hpc_comm_once.as_ref()) {
             let prefixes: Vec<&str> = comm_list.split(',').collect();
             rodata.detect_by_comm = true;
             rodata.nr_comm_prefixes = prefixes
@@ -225,7 +225,7 @@ impl<'a> Scheduler<'a> {
         }
 
         // Populate comm prefixes if provided.
-        if let Some(ref comm_list) = opts.hpc_comm.as_ref().or(opts.hpc_comm_once.as_ref()) {
+        if let Some(comm_list) = opts.hpc_comm.as_ref().or(opts.hpc_comm_once.as_ref()) {
             Self::populate_comm_prefixes(&mut skel, comm_list)?;
         }
 
@@ -647,11 +647,9 @@ impl<'a> Scheduler<'a> {
 
             if let Some(ref prefixes) = comm_once_prefixes {
                 poll_counter += 1;
-                if poll_counter % 3 == 0 {
-                    if !scan_proc_for_comm_prefixes(prefixes) {
-                        info!("all matching processes have exited, shutting down");
-                        break;
-                    }
+                if poll_counter.is_multiple_of(3) && !scan_proc_for_comm_prefixes(prefixes) {
+                    info!("all matching processes have exited, shutting down");
+                    break;
                 }
             }
         }

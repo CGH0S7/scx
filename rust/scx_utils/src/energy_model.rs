@@ -24,7 +24,7 @@ use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
 
-#[derive(Debug, Clone, Eq, Hash, Ord, PartialOrd)]
+#[derive(Debug, Clone, Eq, Ord, PartialOrd)]
 pub struct PerfState {
     pub cost: usize,
     pub frequency: usize,
@@ -33,7 +33,7 @@ pub struct PerfState {
     pub power: usize,
 }
 
-#[derive(Debug, Clone, Eq, Hash, Ord, PartialOrd)]
+#[derive(Debug, Clone, Eq, Ord, PartialOrd)]
 pub struct PerfDomain {
     /// Monotonically increasing unique id.
     pub id: usize,

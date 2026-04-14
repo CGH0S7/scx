@@ -71,15 +71,14 @@ pub struct StatsOps<Req, Res> {
     pub close: Option<Box<dyn StatsCloser<Req, Res>>>,
 }
 
+type OpenOpsEntry<Req, Res> = (
+    Arc<Mutex<StatsOps<Req, Res>>>,
+    Box<dyn StatsReader<Req, Res>>,
+    ChannelPair<Req, Res>,
+);
+
 struct StatsOpenOps<Req, Res> {
-    map: BTreeMap<
-        String,
-        (
-            Arc<Mutex<StatsOps<Req, Res>>>,
-            Box<dyn StatsReader<Req, Res>>,
-            ChannelPair<Req, Res>,
-        ),
-    >,
+    map: BTreeMap<String, OpenOpsEntry<Req, Res>>,
 }
 
 impl<Req, Res> StatsOpenOps<Req, Res> {
@@ -339,6 +338,16 @@ where
             }
             Ok(())
         })
+    }
+}
+
+impl<Req, Res> Default for StatsServerData<Req, Res>
+where
+    Req: Send + 'static,
+    Res: Send + 'static,
+{
+    fn default() -> Self {
+        Self::new()
     }
 }
 
